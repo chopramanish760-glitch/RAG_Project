@@ -1,11 +1,14 @@
-"""mY_Tutor — video learning assistant. Run: streamlit run app.py"""
+"""mY_Tutor — upload videos, auto-transcribe, chat. Run: streamlit run app.py"""
 
 from __future__ import annotations
 
+import hashlib
 import os
-import subprocess
 import time
 from pathlib import Path
+
+# Quiet Hugging Face cache warning on Windows (first FastEmbed download)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -16,182 +19,71 @@ import rag_core
 
 APP_NAME = "mY_Tutor"
 COURSE_NAME = os.getenv("COURSE_NAME", "My course")
-JOBLIB_PATH = Path("embeddings.joblib")
 FAVICON = Path(__file__).parent / "favicon.png"
+MAX_VIDEOS = 5
+
+STEP_LABEL = {
+    "prepare": "Reading file",
+    "extract": "Getting audio",
+    "transcribe": "Writing transcript",
+    "save": "Building search index",
+}
+STEP_PCT = {"prepare": 0.15, "extract": 0.35, "transcribe": 0.75, "save": 0.92}
 
 st.set_page_config(
     page_title=APP_NAME,
     page_icon=str(FAVICON) if FAVICON.exists() else "📘",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
+
+st.cache_resource(rag_core._get_fastembed)()
 
 st.markdown(
     """
 <style>
-  #MainMenu, footer, header {visibility: hidden;}
-  .block-container {
-    padding-top: 1rem;
-    padding-bottom: 5.5rem;
-    max-width: 44rem;
+  #MainMenu, footer {visibility: hidden;}
+  .block-container { padding-top: 0.75rem; padding-bottom: 5rem; max-width: 42rem; }
+  .hero { text-align: center; margin-bottom: 1rem; }
+  .hero h1 {
+    font-size: 2rem; font-weight: 800; margin: 0;
+    background: linear-gradient(90deg, #312e81, #6366f1);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
   }
-  .brand-wrap {
-    text-align: center;
-    padding: 0.5rem 0 1.25rem;
+  .hero p { color: #64748b; font-size: 0.95rem; margin: 0.35rem 0 0; }
+  .timer-box {
+    background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%);
+    border: 1px solid #c7d2fe; border-radius: 16px;
+    padding: 1rem 1.25rem; margin: 0.75rem 0; text-align: center;
   }
-  .brand-logo {
-    width: 52px;
-    height: 52px;
-    border-radius: 14px;
-    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    color: #fff;
-    font-weight: 700;
-    font-size: 1.1rem;
-    margin-bottom: 0.6rem;
-    box-shadow: 0 4px 14px rgba(79, 70, 229, 0.35);
+  .timer-big { font-size: 2rem; font-weight: 700; color: #4338ca; }
+  .ready-banner {
+    background: #ecfdf5; border: 1px solid #6ee7b7; border-radius: 12px;
+    padding: 0.75rem 1rem; text-align: center; color: #047857;
+    font-weight: 600; margin-bottom: 1rem;
   }
-  .brand-title {
-    font-size: 1.75rem;
-    font-weight: 700;
-    margin: 0;
-    letter-spacing: -0.03em;
-    background: linear-gradient(90deg, #312e81, #4f46e5);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-  }
-  .brand-tag {
-    color: #64748b;
-    font-size: 0.88rem;
-    margin-top: 0.25rem;
-  }
-  .status-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.35rem;
-    padding: 0.35rem 0.85rem;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    margin-top: 0.65rem;
-  }
-  .status-ready {
-    background: #ecfdf5;
-    color: #047857;
-    border: 1px solid #a7f3d0;
-  }
-  .status-wait {
-    background: #f1f5f9;
-    color: #475569;
-    border: 1px solid #e2e8f0;
-  }
-  .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    display: inline-block;
-  }
-  .dot-live { background: #10b981; animation: pulse 1.5s infinite; }
-  .dot-idle { background: #94a3b8; }
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.5; transform: scale(0.85); }
-  }
-  .welcome-card {
-    background: linear-gradient(180deg, #f8fafc 0%, #fff 100%);
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 1.75rem 1.25rem;
-    text-align: center;
-    margin-bottom: 1rem;
-  }
-  .welcome-card h2 {
-    font-size: 1.15rem;
-    font-weight: 600;
-    color: #1e293b;
-    margin: 0 0 0.4rem;
-  }
-  .welcome-card p { color: #64748b; font-size: 0.9rem; margin: 0; }
-  .upload-card {
-    border: 1px dashed #c7d2fe;
-    border-radius: 16px;
-    padding: 1rem 1.1rem 0.75rem;
-    background: #fafaff;
-    margin-bottom: 0.75rem;
-    transition: border-color 0.2s, box-shadow 0.2s;
-  }
-  .upload-card:hover {
-    border-color: #818cf8;
-    box-shadow: 0 4px 20px rgba(79, 70, 229, 0.08);
-  }
-  .file-chip {
-    display: inline-block;
-    background: #eef2ff;
-    color: #3730a3;
-    padding: 0.2rem 0.55rem;
-    border-radius: 8px;
-    font-size: 0.75rem;
-    margin: 0.15rem 0.2rem 0 0;
-  }
-  div[data-testid="stChatMessage"] {
-    background: transparent !important;
-  }
-  .stButton > button[kind="primary"] {
-    border-radius: 10px;
-    font-weight: 600;
-  }
-  .job-card {
-    border: 1px solid #e2e8f0;
-    border-radius: 12px;
-    padding: 0.65rem 0.85rem;
-    margin-bottom: 0.5rem;
-    background: #fff;
-  }
-  .job-card.active {
-    border-color: #818cf8;
-    background: #f5f3ff;
-    box-shadow: 0 2px 12px rgba(79, 70, 229, 0.12);
-  }
-  .job-card.done { border-color: #6ee7b7; background: #ecfdf5; }
-  .job-card.error { border-color: #fca5a5; background: #fef2f2; }
-  .job-card.wait { opacity: 0.55; }
-  .job-title { font-weight: 600; font-size: 0.88rem; color: #1e293b; }
-  .job-step { font-size: 0.8rem; color: #4f46e5; margin-top: 0.15rem; }
-  .job-eta { font-size: 0.75rem; color: #64748b; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-MAX_VIDEOS = 5
-STAGE_LABELS = {
-    "prepare": "Preparing upload",
-    "extract": "Extracting audio",
-    "transcribe": "Transcribing speech",
-    "index": "Indexing for search",
-    "done": "Complete",
-    "error": "Failed",
-    "queued": "Waiting in queue",
+_DEFAULTS = {
+    "df": None,
+    "ready": False,
+    "messages": [],
+    "sources": {},
+    "ready_videos": [],
+    "suggested_questions": [],
+    "done_sigs": set(),
+    "pending_queue": [],
+    "last_error": None,
+    "last_success": None,
+    "is_processing": False,
+    "answering": False,
 }
-STAGE_PROGRESS = {
-    "queued": 0.05,
-    "prepare": 0.2,
-    "extract": 0.4,
-    "transcribe": 0.7,
-    "index": 0.9,
-    "done": 1.0,
-    "error": 1.0,
-}
-
-if "df" not in st.session_state:
-    st.session_state.df = None
-    st.session_state.ready = False
-    st.session_state.messages = []
-    st.session_state.sources = {}
-    st.session_state.indexed_videos = []
-    st.session_state.suggested_questions = []
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v if not isinstance(v, set) else set()
 
 
 def set_ready(df) -> None:
@@ -199,389 +91,304 @@ def set_ready(df) -> None:
     st.session_state.ready = df is not None and not df.empty
 
 
-def refresh_suggestions() -> None:
-    if st.session_state.ready and st.session_state.df is not None:
-        with st.spinner("Preparing suggested questions…"):
-            st.session_state.suggested_questions = rag_core.build_suggested_questions(
-                st.session_state.df,
-                course_name=COURSE_NAME,
-                count=5,
-            )
+def file_sig(name: str, data: bytes) -> tuple:
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    return (name, len(data), digest)
 
 
-def render_suggested_questions() -> None:
-    questions = st.session_state.get("suggested_questions") or []
-    if not questions or not st.session_state.ready:
-        return
-    st.markdown("#### Suggested questions")
-    st.caption("Based on your transcript — tap to ask")
-    cols = st.columns(min(len(questions), 2))
-    for i, q in enumerate(questions):
-        with cols[i % 2]:
-            if st.button(q, key=f"suggest_{i}_{hash(q) % 10**6}", use_container_width=True):
-                ask_tutor(q)
-                st.rerun()
+def reset_chat() -> None:
+    st.session_state.messages = []
+    st.session_state.sources = {}
+    st.session_state.suggested_questions = []
+
+
+def reset_lesson_state() -> None:
+    """Drop indexed videos and chat — use when starting a new single upload."""
+    reset_chat()
+    st.session_state.df = None
+    st.session_state.ready = False
+    st.session_state.ready_videos = []
+    st.session_state.done_sigs = set()
+    st.session_state.last_success = None
+    st.session_state.last_error = None
+
+
+def fmt_time(seconds: int) -> str:
+    s = max(0, int(seconds))
+    m, sec = divmod(s, 60)
+    return f"{m:02d}:{sec:02d}" if m else f"0:{sec:02d}"
 
 
 def ask_tutor(question: str) -> None:
+    if st.session_state.answering:
+        return
+    st.session_state.answering = True
     st.session_state.messages.append({"role": "user", "content": question})
+    answer = ""
     try:
-        answer, ctx = rag_core.answer_question(
-            st.session_state.df,
-            question,
-            course_name=COURSE_NAME,
-        )
-        src_lines = []
+        with st.spinner("Searching transcript and writing answer (15–30s)…"):
+            answer, ctx = rag_core.answer_question(
+                st.session_state.df, question, course_name=COURSE_NAME
+            )
+        lines = []
         for _, row in ctx.iterrows():
-            ts = rag_core.format_timestamp(row["start"])
-            snippet = str(row["text"])[:160]
-            src_lines.append(f"- **{row['title']}** `{ts}` — {snippet}")
-        st.session_state.sources[str(len(st.session_state.messages))] = "\n".join(src_lines)
+            ts = rag_core.format_timestamp_range(row["start"], row["end"])
+            lines.append(f"- **{row['title']}** `{ts}` — {str(row['text'])[:140]}")
+        st.session_state.sources[str(len(st.session_state.messages))] = "\n".join(lines)
     except Exception as e:
-        answer = f"Something went wrong: {e}"
-    st.session_state.messages.append({"role": "assistant", "content": answer})
+        answer = f"Sorry, something went wrong: {e}"
+    finally:
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": rag_core.fix_timestamps_in_text(answer),
+            }
+        )
+        st.session_state.answering = False
 
 
-# --- API key ---
-if not os.getenv("GEMINI_API_KEY") and not os.getenv("GROQ_API_KEY"):
-    st.error("Add **GEMINI_API_KEY** to `.env` or Streamlit Secrets.")
-    st.stop()
+def queue_uploads(uploaded_files) -> None:
+    """Save file bytes in session so they survive reruns."""
+    files = list(uploaded_files[:MAX_VIDEOS])
+    new_items: list[dict] = []
+    for f in files:
+        data = f.getvalue()
+        sig = file_sig(f.name, data)
+        if sig in st.session_state.done_sigs:
+            continue
+        already = {item["sig"] for item in st.session_state.pending_queue}
+        if sig in already:
+            continue
+        new_items.append({"name": f.name, "bytes": data, "sig": sig})
 
-ready = st.session_state.ready
-dot_class = "dot-live" if ready else "dot-idle"
-status_class = "status-ready" if ready else "status-wait"
-if ready:
-    status_text = f"Online · {len(st.session_state.df)} segments ready"
-else:
-    status_text = "Waiting for your video"
+    if not new_items:
+        return
 
-# --- Header ---
-st.markdown(
-    f"""
-<div class="brand-wrap">
-  <div class="brand-logo">mY</div>
-  <h1 class="brand-title">{APP_NAME}</h1>
-  <p class="brand-tag">Up to {MAX_VIDEOS} videos · Ask anything · Get timestamps</p>
-  <span class="status-pill {status_class}">
-    <span class="dot {dot_class}"></span> {status_text}
-  </span>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+    # One new file to process = new lesson (even if an old chip is still in the uploader)
+    if len(new_items) == 1:
+        reset_lesson_state()
+    else:
+        reset_chat()
 
-# --- Sidebar ---
-with st.sidebar:
-    st.markdown(f"### {APP_NAME}")
-    if JOBLIB_PATH.exists():
-        if st.button("Load saved index", use_container_width=True):
-            with st.spinner("Loading…"):
-                set_ready(rag_core.load_joblib(JOBLIB_PATH))
-                st.session_state.indexed_videos = ["Saved course index"]
-                st.session_state.messages = [
-                    {
-                        "role": "assistant",
-                        "content": "Saved index loaded. Ask me anything about the course.",
-                    }
-                ]
-                refresh_suggestions()
-            st.rerun()
-    if st.button("New chat", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.sources = {}
-        # keep suggested_questions — still based on indexed transcript
-        st.rerun()
-    if st.session_state.ready and st.button("Refresh suggestions", use_container_width=True):
-        refresh_suggestions()
-        st.rerun()
-    if st.button("Reset everything", use_container_width=True):
-        st.session_state.df = None
-        st.session_state.ready = False
-        st.session_state.messages = []
-        st.session_state.sources = {}
-        st.session_state.indexed_videos = []
-        st.session_state.suggested_questions = []
-        st.rerun()
+    st.session_state.pending_queue.extend(new_items)
 
-# Indexed file chips
-if st.session_state.indexed_videos:
-    chips = "".join(
-        f'<span class="file-chip">{name}</span>'
-        for name in st.session_state.indexed_videos
+
+def process_queue() -> None:
+    """Process all pending files — no st.rerun(), status stays visible."""
+    queue = st.session_state.pending_queue
+    if not queue:
+        return
+
+    st.session_state.is_processing = True
+    st.session_state.last_error = None
+    batch_eta = max(
+        60,
+        sum(rag_core.estimate_processing_seconds(item["bytes"], item["name"]) for item in queue),
     )
-    st.markdown(f"**Indexed:** {chips}", unsafe_allow_html=True)
+    batch_start = time.time()
 
-# Welcome
-if not st.session_state.messages and not ready:
-    st.markdown(
-        f"""
-<div class="welcome-card">
-  <h2>Start in 2 steps</h2>
-  <p>1. Attach up to <strong>{MAX_VIDEOS}</strong> videos &nbsp;→&nbsp; 2. Tap <strong>Index all</strong> &nbsp;→&nbsp; chat here</p>
-</div>
-""",
+    st.markdown("#### Processing your upload")
+    st.caption("Please keep this tab open. Transcription can take a few minutes.")
+    progress = st.progress(0.0, text="Starting…")
+    timer_box = st.empty()
+    status_line = st.empty()
+
+    def refresh_ui(video_i: int, total: int, stage: str, filename: str, msg: str) -> None:
+        elapsed = time.time() - batch_start
+        remaining = max(0, int(batch_eta - elapsed))
+        pct = STEP_PCT.get(stage, 0.5)
+        overall = min(0.98, ((video_i - 1) + pct) / total)
+        label = STEP_LABEL.get(stage, stage)
+        progress.progress(overall, text=f"Video {video_i}/{total} · {label}")
+        status_line.markdown(f"**{filename}** — {msg}")
+        timer_box.markdown(
+            f'<div class="timer-box">'
+            f'<div style="color:#64748b;font-size:14px;">Video {video_i} of {total} · {label}</div>'
+            f'<div class="timer-big">{fmt_time(remaining)}</div>'
+            f'<div style="color:#94a3b8;font-size:12px;">estimated time left · elapsed {fmt_time(int(elapsed))}</div>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    ok_names = []
+    still_pending = []
+    replace_mode = len(queue) == 1
+    for idx, item in enumerate(queue):
+        num = idx + 1
+        name = item["name"]
+        data = item["bytes"]
+        sig = item["sig"]
+        refresh_ui(num, len(queue), "prepare", name, "Starting…")
+
+        def on_step(stage: str, msg: str, _n=num, _name=name):
+            refresh_ui(_n, len(queue), stage, _name, msg)
+
+        try:
+            new_df = rag_core.process_uploaded_media(
+                data, name, on_step=on_step, language=None
+            )
+            if replace_mode:
+                st.session_state.df = new_df.reset_index(drop=True)
+                st.session_state.ready_videos = [name]
+            else:
+                st.session_state.df = rag_core.merge_dataframes(
+                    st.session_state.df, new_df
+                )
+                if name not in st.session_state.ready_videos:
+                    st.session_state.ready_videos.append(name)
+            set_ready(st.session_state.df)
+            st.session_state.done_sigs.add(sig)
+            ok_names.append(name)
+            st.success(f"**{name}** is ready")
+        except Exception as e:
+            st.session_state.last_error = f"**{name}:** {str(e)}"
+            st.error(st.session_state.last_error)
+            still_pending.append(item)
+
+    st.session_state.pending_queue = still_pending
+    elapsed = max(1, int(time.time() - batch_start))
+    progress.progress(1.0, text="Finished")
+    timer_box.markdown(
+        f'<div class="timer-box" style="background:#ecfdf5;border-color:#6ee7b7;">'
+        f'<div class="timer-big" style="color:#047857;">Done · {fmt_time(elapsed)}</div></div>',
         unsafe_allow_html=True,
     )
 
-# Chat history
+    if ok_names:
+        st.session_state.last_success = ", ".join(ok_names)
+        with st.spinner("Preparing question ideas…"):
+            st.session_state.suggested_questions = rag_core.build_suggested_questions(
+                st.session_state.df, course_name=COURSE_NAME, count=5
+            )
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": f"Your video is ready: **{st.session_state.last_success}**. Ask below.",
+            }
+        )
+        st.balloons()
+    elif st.session_state.last_error:
+        st.warning("Processing failed. Click **Try again** in the sidebar (left) or upload again.")
+
+    st.session_state.is_processing = False
+
+
+# --- API ---
+if not os.getenv("GEMINI_API_KEY") and not os.getenv("GROQ_API_KEY"):
+    st.error("Add **GEMINI_API_KEY** or **GROQ_API_KEY** to `.env` or Streamlit Secrets.")
+    st.stop()
+
+def clear_all_session() -> None:
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
+
+with st.sidebar:
+    st.caption("mY_Tutor")
+    st.markdown("Use **»** (top-left) if this panel is hidden.")
+    st.markdown(
+        "**Quota error (429)?**  \n"
+        "Wait 1 min → **Try again**  \n"
+        "Or add **GROQ_API_KEY** in `.env`  \n"
+        "[Free Groq key](https://console.groq.com/keys)"
+    )
+    st.caption("First answer can take ~15–30s (search + AI).")
+    if st.session_state.pending_queue and st.button("Try again", use_container_width=True):
+        st.session_state.last_error = None
+        st.rerun()
+    if st.button("Clear all & start over", use_container_width=True):
+        clear_all_session()
+        st.rerun()
+
+col_opts, _ = st.columns([1, 3])
+with col_opts:
+    if st.button("Clear all & start over", key="clear_main"):
+        clear_all_session()
+        st.rerun()
+
+st.markdown(
+    f'<div class="hero"><h1>{APP_NAME}</h1>'
+    f"<p>Upload your lesson — transcribed with {rag_core.provider_label()}</p></div>",
+    unsafe_allow_html=True,
+)
+
+if st.session_state.ready:
+    titles = ", ".join(st.session_state.ready_videos) or "your video"
+    st.markdown(
+        f'<div class="ready-banner">Ready · {titles}</div>',
+        unsafe_allow_html=True,
+    )
+
+if st.session_state.last_error and not st.session_state.is_processing:
+    st.error(st.session_state.last_error)
+
+if st.session_state.last_success and st.session_state.ready:
+    st.caption(f"Last processed: {st.session_state.last_success}")
+
+uploaded = st.file_uploader(
+    "Upload video or audio",
+    type=["mp4", "webm", "mov", "mkv", "mp3", "wav", "m4a", "ogg"],
+    accept_multiple_files=True,
+    label_visibility="collapsed",
+    key="video_uploader",
+)
+st.caption(
+    "New lesson? Remove the old file with **×**, then upload again, "
+    "or click **Clear all & start over** above."
+)
+
+if uploaded:
+    if len(uploaded) > MAX_VIDEOS:
+        st.warning(f"Only the first {MAX_VIDEOS} files are used.")
+    before = len(st.session_state.pending_queue)
+    queue_uploads(list(uploaded))
+    if (
+        len(st.session_state.pending_queue) == before
+        and not st.session_state.is_processing
+        and st.session_state.ready
+    ):
+        st.info(
+            "This file is already indexed. Click **×** on it and upload your new video, "
+            "or **Clear all & start over** above."
+        )
+
+if st.session_state.pending_queue and not st.session_state.is_processing:
+    process_queue()
+
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant" and str(i) in st.session_state.sources:
-            with st.expander("View sources"):
+            with st.expander("Sources"):
                 st.markdown(st.session_state.sources[str(i)])
 
-render_suggested_questions()
+if st.session_state.ready and st.session_state.suggested_questions:
+    st.markdown("##### Tap a question")
+    cols = st.columns(2)
+    busy = st.session_state.answering or st.session_state.is_processing
+    for i, q in enumerate(st.session_state.suggested_questions):
+        if cols[i % 2].button(
+            q, key=f"q{i}", use_container_width=True, disabled=busy
+        ):
+            ask_tutor(q)
+            st.rerun()
 
-def _format_eta(seconds: int) -> str:
-    if seconds < 60:
-        return f"~{max(1, seconds)} sec"
-    return f"~{seconds // 60} min {seconds % 60} sec"
+if (
+    not st.session_state.ready
+    and not st.session_state.pending_queue
+    and not st.session_state.is_processing
+    and not uploaded
+):
+    st.info("Drop a video above — processing starts automatically.")
 
-
-def _render_job_card(
-    slot,
-    *,
-    video_num: int,
-    name: str,
-    stage: str,
-    detail: str = "",
-    progress: float = 0.0,
-    eta_sec: int | None = None,
-    size_mb: float = 0.0,
-) -> None:
-    css = "active" if stage not in ("done", "error", "queued") else stage
-    if stage == "queued":
-        css = "wait"
-    elif stage == "done":
-        css = "done"
-    elif stage == "error":
-        css = "error"
-    label = STAGE_LABELS.get(stage, stage)
-    eta_line = ""
-    if eta_sec is not None and stage not in ("done", "error"):
-        eta_line = f'<div class="job-eta">About {_format_eta(eta_sec)} remaining</div>'
-    detail_line = f'<div class="job-step">{detail or label}</div>' if stage != "queued" else ""
-    slot.markdown(
-        f"""
-<div class="job-card {css}">
-  <div class="job-title">Video {video_num}: {name}</div>
-  <div class="job-eta">{size_mb:.1f} MB</div>
-  {detail_line}
-  {eta_line}
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-    slot.progress(min(1.0, max(0.0, progress)), text=f"{label}…")
-
-
-# Upload card
-st.markdown('<div class="upload-card">', unsafe_allow_html=True)
-uploaded_files = st.file_uploader(
-    f"Drop up to {MAX_VIDEOS} videos or audio files",
-    type=["mp4", "webm", "mov", "mkv", "mp3", "wav", "m4a", "ogg"],
-    accept_multiple_files=True,
-    help=f"Select 1–{MAX_VIDEOS} files · MP4, MP3, WAV · max ~100 MB each",
-)
-files = list(uploaded_files or [])
-if len(files) > MAX_VIDEOS:
-    st.warning(f"Only **{MAX_VIDEOS}** videos allowed. Processing the first {MAX_VIDEOS}.")
-    files = files[:MAX_VIDEOS]
-
-if files:
-    total_mb = sum(len(f.getvalue()) for f in files) / (1024 * 1024)
-    total_eta = sum(rag_core.estimate_processing_seconds(f.getvalue(), f.name) for f in files)
-    st.caption(
-        f"**{len(files)}** file(s) selected · **{total_mb:.1f} MB** total · "
-        f"estimated **{_format_eta(total_eta)}** to process all"
-    )
-
-c1, c2, c3 = st.columns([2, 2, 1])
-with c1:
-    lang = st.text_input("Language (optional)", placeholder="en, hi, …")
-with c2:
-    st.caption("Leave blank to auto-detect")
-with c3:
-    index_btn = st.button(
-        "Index all",
-        type="primary",
-        use_container_width=True,
-        disabled=not files,
-    )
-st.markdown("</div>", unsafe_allow_html=True)
-
-if index_btn and files:
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": f"Indexing **{len(files)}** video(s)…",
-        }
-    )
-
-    st.markdown("### Processing queue")
-    job_slots = [st.empty() for _ in files]
-    overall = st.progress(0, text="Starting queue…")
-    overall_eta_label = st.empty()
-
-    lang_code = lang.strip() or None
-    results_ok = []
-    results_fail = []
-    batch_start = time.time()
-    batch_eta = sum(
-        rag_core.estimate_processing_seconds(f.getvalue(), f.name) for f in files
-    )
-
-    for idx, uploaded in enumerate(files):
-        video_num = idx + 1
-        file_bytes = uploaded.getvalue()
-        size_mb = len(file_bytes) / (1024 * 1024)
-        eta_this = rag_core.estimate_processing_seconds(file_bytes, uploaded.name)
-        file_start = time.time()
-
-        def make_on_step(vnum, slot, start_t, eta, fname):
-            def on_step(stage: str, msg: str) -> None:
-                elapsed = time.time() - start_t
-                remaining = max(0, int(eta - elapsed))
-                prog = STAGE_PROGRESS.get(stage, 0.5)
-                _render_job_card(
-                    slot,
-                    video_num=vnum,
-                    name=fname,
-                    stage=stage,
-                    detail=msg,
-                    progress=prog,
-                    eta_sec=remaining,
-                    size_mb=size_mb,
-                )
-                batch_elapsed = time.time() - batch_start
-                batch_remaining = max(0, int(batch_eta - batch_elapsed))
-                done_frac = (vnum - 1 + prog) / len(files)
-                overall.progress(done_frac, text=f"Video {vnum} of {len(files)} · {msg}")
-                overall_eta_label.caption(
-                    f"**Overall:** {_format_eta(batch_remaining)} remaining "
-                    f"(~{_format_eta(batch_eta)} total estimated)"
-                )
-
-            return on_step
-
-        # Show queued state for upcoming videos
-        for j, slot in enumerate(job_slots):
-            if j < idx:
-                _render_job_card(
-                    job_slots[j],
-                    video_num=j + 1,
-                    name=files[j].name,
-                    stage="done",
-                    detail="Finished",
-                    progress=1.0,
-                    size_mb=len(files[j].getvalue()) / (1024 * 1024),
-                )
-            elif j == idx:
-                _render_job_card(
-                    slot,
-                    video_num=video_num,
-                    name=uploaded.name,
-                    stage="prepare",
-                    detail="Upload received · starting…",
-                    progress=0.15,
-                    eta_sec=eta_this,
-                    size_mb=size_mb,
-                )
-            else:
-                wait_eta = rag_core.estimate_processing_seconds(
-                    files[j].getvalue(), files[j].name
-                )
-                _render_job_card(
-                    slot,
-                    video_num=j + 1,
-                    name=files[j].name,
-                    stage="queued",
-                    detail="Waiting…",
-                    progress=0.05,
-                    eta_sec=wait_eta,
-                    size_mb=len(files[j].getvalue()) / (1024 * 1024),
-                )
-
-        on_step = make_on_step(video_num, job_slots[idx], file_start, eta_this, uploaded.name)
-
-        try:
-            new_df = rag_core.process_uploaded_media(
-                file_bytes,
-                uploaded.name,
-                on_step=on_step,
-                language=lang_code,
-            )
-            merged = rag_core.merge_dataframes(st.session_state.df, new_df)
-            set_ready(merged)
-            st.session_state.indexed_videos.append(uploaded.name)
-            st.session_state.df = merged
-            results_ok.append((uploaded.name, len(new_df)))
-            _render_job_card(
-                job_slots[idx],
-                video_num=video_num,
-                name=uploaded.name,
-                stage="done",
-                detail=f"Done · {len(new_df)} segments indexed",
-                progress=1.0,
-                size_mb=size_mb,
-            )
-        except subprocess.CalledProcessError:
-            results_fail.append((uploaded.name, "ffmpeg required for video"))
-            _render_job_card(
-                job_slots[idx],
-                video_num=video_num,
-                name=uploaded.name,
-                stage="error",
-                detail="ffmpeg not found",
-                progress=1.0,
-                size_mb=size_mb,
-            )
-        except Exception as e:
-            results_fail.append((uploaded.name, str(e)))
-            _render_job_card(
-                job_slots[idx],
-                video_num=video_num,
-                name=uploaded.name,
-                stage="error",
-                detail=str(e)[:80],
-                progress=1.0,
-                size_mb=size_mb,
-            )
-
-    overall.progress(1.0, text="Queue complete")
-    elapsed_total = int(time.time() - batch_start)
-    overall_eta_label.caption(f"Finished in **{_format_eta(elapsed_total)}**")
-
-    if results_ok:
-        names = ", ".join(f"**{n}**" for n, _ in results_ok)
-        segs = sum(s for _, s in results_ok)
-        with st.spinner("Generating suggested questions from transcript…"):
-            st.session_state.suggested_questions = rag_core.build_suggested_questions(
-                st.session_state.df,
-                course_name=COURSE_NAME,
-                count=5,
-            )
-        bullets = "\n".join(f"- {q}" for q in st.session_state.suggested_questions)
-        reply = (
-            f"Analysis complete! Indexed {names} ({segs} segments).\n\n"
-            f"**Try asking:**\n{bullets}"
-        )
-        st.session_state.messages.append({"role": "assistant", "content": reply})
-        st.balloons()
-    if results_fail:
-        fail_txt = "; ".join(f"{n}: {err}" for n, err in results_fail)
-        st.session_state.messages.append(
-            {"role": "assistant", "content": f"Some files failed: {fail_txt}"}
-        )
-    st.rerun()
-
-# Chat input
 prompt = st.chat_input(
-    f"Message {APP_NAME}…",
-    disabled=not ready,
+    "Ask about your video…",
+    disabled=(
+        not st.session_state.ready
+        or st.session_state.is_processing
+        or st.session_state.answering
+    ),
 )
-
-if prompt and ready:
+if prompt and st.session_state.ready:
     ask_tutor(prompt)
     st.rerun()

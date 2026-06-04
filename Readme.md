@@ -14,7 +14,9 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-5. Upload videos → **Index all** → use suggested questions or chat.
+5. Upload videos (wait until each is ready) → use suggested questions or chat.
+
+**First run:** FastEmbed downloads a small model (~67 MB) once; HF Hub warnings on Windows are harmless.
 
 ## Deploy online
 
@@ -28,7 +30,7 @@ Full steps: **[DEPLOY.md](DEPLOY.md)**
 |---------|---------|
 | Transcription | Gemini |
 | Chat & suggestions | Gemini |
-| Embeddings | Gemini `text-embedding-004` |
+| Embeddings | Local FastEmbed (BGE-small); optional Gemini |
 | Fallback | Groq (optional) |
 
 ## Repo

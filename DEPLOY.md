@@ -9,7 +9,7 @@ Alternatives: [Hugging Face Spaces](https://huggingface.co/spaces) (Docker), [Ra
 ## What you need before deploy
 
 1. **GitHub account** — https://github.com
-2. **Gemini API key** — https://aistudio.google.com/apikey (or Groq as fallback)  
+2. **Groq API key** — https://console.groq.com/keys (recommended; Gemini optional fallback)  
 3. This project pushed to a **public** GitHub repo (Streamlit free tier needs public repos)
 
 ---
@@ -44,8 +44,18 @@ Optional: add `embeddings.joblib` only if you want the demo course button (file 
 4. Click **Advanced settings** → **Secrets** and paste:
 
 ```toml
-GEMINI_API_KEY = "your_gemini_key_here"
+AI_PROVIDER = "groq"
+GROQ_API_KEY = "your_groq_key_here"
+PREFER_GROQ_TRANSCRIBE = "true"
+PREFER_GROQ_CHAT = "true"
 COURSE_NAME = "Sigma Web Development"
+MAX_UPLOAD_MB = "24"
+```
+
+Optional fallback:
+
+```toml
+GEMINI_API_KEY = "your_gemini_key_here"
 ```
 
 5. Click **Deploy**.
@@ -58,7 +68,7 @@ First build takes **5–10 minutes** (downloads FastEmbed model). Later deploys 
 
 1. Open the URL Streamlit gives you (e.g. `https://your-app.streamlit.app`).
 2. Upload a short **MP3** or small **MP4** (under ~24 MB for Groq).
-3. Click **Index** — wait for “ready”.
+3. Wait until the video is **ready** (auto-processing).
 4. Ask a question in the chat box.
 
 ---
@@ -87,7 +97,7 @@ streamlit run app.py
 | `requirements.txt` | Python packages |
 | `packages.txt` | Installs **ffmpeg** on Linux (for video → audio) |
 | `.streamlit/config.toml` | Theme / server settings |
-| Secrets | `GEMINI_API_KEY` |
+| Secrets | `GROQ_API_KEY`, `AI_PROVIDER=groq` |
 
 ---
 
@@ -116,7 +126,7 @@ streamlit run app.py
 
 | Problem | Fix |
 |---------|-----|
-| API key error | Add `GEMINI_API_KEY` in Streamlit Secrets and reboot app |
+| API key error | Add `GROQ_API_KEY` in Streamlit Secrets and reboot app |
 | ffmpeg error | Ensure `packages.txt` contains `ffmpeg` and redeploy |
 | File too large | Shorter video or export audio-only MP3 |
 | App sleeps / cold start | Normal on free tier; first user waits longer |

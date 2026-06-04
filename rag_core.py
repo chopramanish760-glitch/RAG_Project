@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -16,8 +17,8 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash")
-GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash-lite")
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
@@ -38,6 +39,70 @@ def use_gemini() -> bool:
 
 def use_groq() -> bool:
     return bool(GROQ_API_KEY.strip())
+
+
+def _ai_provider() -> str:
+    return os.getenv("AI_PROVIDER", "auto").strip().lower()
+
+
+def groq_primary() -> bool:
+    """When true, use Groq for transcribe/chat; Gemini only if Groq fails."""
+    if _ai_provider() == "groq":
+        return use_groq()
+    if _ai_provider() == "gemini":
+        return False
+    return use_groq() and os.getenv("PREFER_GROQ_TRANSCRIBE", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def prefer_groq_transcribe() -> bool:
+    """Use Groq Whisper for uploads (avoids Gemini free-tier video limits)."""
+    if not use_groq():
+        return False
+    if groq_primary():
+        return True
+    val = os.getenv("PREFER_GROQ_TRANSCRIBE", "true").lower()
+    return val in ("1", "true", "yes")
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "429" in msg or "resource_exhausted" in msg or "quota exceeded" in msg
+
+
+def _retry_delay_seconds(exc: Exception, default: int = 45) -> int:
+    match = re.search(r"retry in ([\d.]+)s", str(exc), re.I)
+    if match:
+        return min(90, int(float(match.group(1))) + 5)
+    return default
+
+
+def friendly_groq_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "429" in msg or "rate" in msg or "quota" in msg:
+        return "Groq rate limit reached. Wait about a minute, then click **Try again**."
+    return f"Groq error: {exc}"
+
+
+def friendly_api_error(exc: Exception) -> str:
+    if _is_rate_limit_error(exc):
+        wait = _retry_delay_seconds(exc)
+        extra = ""
+        if use_groq():
+            extra = " The app will try Groq automatically if configured."
+        else:
+            extra = (
+                " Add a free **GROQ_API_KEY** in `.env` (https://console.groq.com/keys) "
+                "so transcription can continue when Gemini is busy."
+            )
+        return (
+            f"Gemini free-tier limit reached. Wait about **{wait} seconds**, then click "
+            f"**Try again**. Check usage: https://ai.google.dev/gemini-api/docs/rate-limits.{extra}"
+        )
+    return str(exc)
 
 
 def require_api_key() -> None:
@@ -83,7 +148,8 @@ def _get_fastembed():
 
 
 def format_timestamp(seconds: float) -> str:
-    s = int(seconds)
+    """Wall-clock time for video position (M:SS or H:MM:SS)."""
+    s = max(0, int(round(float(seconds))))
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     if h:
@@ -91,39 +157,144 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{sec:02d}"
 
 
+def format_timestamp_range(start: float, end: float) -> str:
+    a = format_timestamp(start)
+    b = format_timestamp(end)
+    return a if a == b else f"{a}–{b}"
+
+
+_BAD_CLOCK_TS = re.compile(r"\b(\d{1,3}):(\d{2,})\b")
+
+
+def fix_timestamps_in_text(text: str) -> str:
+    """Fix LLM mistakes like 27:83 (meant 27.83 seconds → 0:27)."""
+
+    def _fix(match: re.Match[str]) -> str:
+        left, right = int(match.group(1)), int(match.group(2))
+        if right < 60:
+            return match.group(0)
+        if left >= 180:
+            return match.group(0)
+        # Treat as decimal seconds (27:83 → 27.83s)
+        secs = left + right / (10 ** len(match.group(2)))
+        return format_timestamp(secs)
+
+    return _BAD_CLOCK_TS.sub(_fix, text)
+
+
+def _context_for_prompt(context_df: pd.DataFrame) -> str:
+    rows = []
+    for _, row in context_df.iterrows():
+        rows.append(
+            {
+                "video": str(row.get("title", "Lesson")),
+                "at": format_timestamp(float(row.get("start", 0))),
+                "until": format_timestamp(float(row.get("end", 0))),
+                "text": str(row.get("text", ""))[:400],
+            }
+        )
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+GEMINI_EMBED_BATCH_MAX = 100
+
+
 def _gemini_embeddings(text_list: list[str]) -> list[list[float]]:
+    """Gemini allows at most 100 texts per embed request."""
+    if len(text_list) > GEMINI_EMBED_BATCH_MAX:
+        model = _get_fastembed()
+        return [vec.tolist() for vec in model.embed(text_list)]
+
     client = _gemini()
-    result = client.models.embed_content(model=GEMINI_EMBED_MODEL, contents=text_list)
-    return [list(e.values) for e in result.embeddings]
+    all_vectors: list[list[float]] = []
+    for start in range(0, len(text_list), GEMINI_EMBED_BATCH_MAX):
+        batch = text_list[start : start + GEMINI_EMBED_BATCH_MAX]
+        result = client.models.embed_content(model=GEMINI_EMBED_MODEL, contents=batch)
+        all_vectors.extend([list(e.values) for e in result.embeddings])
+    return all_vectors
+
+
+def _use_gemini_embeddings() -> bool:
+    return os.getenv("USE_GEMINI_EMBEDDINGS", "").lower() in ("1", "true", "yes") and use_gemini()
+
+
+def _embed_fallback_needed(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        _is_rate_limit_error(exc)
+        or "invalid_argument" in msg
+        or "not_found" in msg
+        or "404" in msg
+    )
 
 
 def create_embeddings(text_list: list[str]) -> list[list[float]]:
+    """Local FastEmbed by default — avoids Gemini embed 404 / batch limits."""
     if not text_list:
         return []
-    if use_gemini():
-        return _gemini_embeddings(text_list)
+    if _use_gemini_embeddings():
+        try:
+            return _gemini_embeddings(text_list)
+        except Exception as e:
+            if not _embed_fallback_needed(e):
+                raise
     model = _get_fastembed()
     return [vec.tolist() for vec in model.embed(text_list)]
 
 
-def video_to_mp3(video_path: str, mp3_path: str) -> None:
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            video_path,
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-q:a",
-            "4",
-            mp3_path,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
+VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".mpeg", ".mpg", ".m4v"}
+
+
+def find_ffmpeg() -> str:
+    custom = os.getenv("FFMPEG_PATH", "").strip()
+    if custom and Path(custom).exists():
+        return custom
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for candidate in (
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe"),
+    ):
+        if Path(candidate).exists():
+            return candidate
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).exists():
+            return bundled
+    except ImportError:
+        pass
+    raise FileNotFoundError(
+        "ffmpeg not found. Run: pip install imageio-ffmpeg  OR  winget install Gyan.FFmpeg"
     )
+
+
+def video_to_mp3(video_path: str, mp3_path: str) -> None:
+    ffmpeg = find_ffmpeg()
+    try:
+        subprocess.run(
+            [
+                ffmpeg,
+                "-y",
+                "-i",
+                str(video_path),
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-q:a",
+                "4",
+                str(mp3_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or e.stdout or str(e))[:200]
+        raise RuntimeError(f"Could not extract audio from video. {err}") from e
 
 
 def _safe_title(name: str) -> str:
@@ -146,22 +317,45 @@ def _parse_json_segments(text: str) -> list[dict]:
         match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
         if match:
             text = match.group(1).strip()
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", text)
+        if not match:
+            raise ValueError("Gemini returned an invalid transcript format. Try again.") from None
+        data = json.loads(match.group(0))
     if isinstance(data, dict) and "segments" in data:
         data = data["segments"]
     if not isinstance(data, list):
-        raise ValueError("Expected a JSON array of segments.")
+        raise ValueError("Expected a JSON array of transcript segments.")
     return data
 
 
 def transcribe_with_gemini(
-    audio_path: str,
+    media_path: str,
     title: str,
     *,
     language: str | None = None,
+    on_pulse: Callable[[], None] | None = None,
 ) -> list[dict]:
     client = _gemini()
-    uploaded = client.files.upload(file=audio_path)
+    path = Path(media_path)
+    upload_path = str(path)
+    # Safe copy for APIs that dislike spaces/parentheses in paths
+    if re.search(r"[^\w.\-]", path.name):
+
+        def _safe_copy() -> str:
+            safe = re.sub(r"[^\w.\-]", "_", path.name) or "media.bin"
+            dest = path.parent / safe
+            dest.write_bytes(path.read_bytes())
+            return str(dest)
+
+        upload_path = _safe_copy()
+
+    try:
+        uploaded = client.files.upload(file=upload_path)
+    except Exception as e:
+        raise RuntimeError(f"Could not upload file to Gemini: {e}") from e
 
     for _ in range(120):
         meta = client.files.get(name=uploaded.name)
@@ -172,20 +366,45 @@ def transcribe_with_gemini(
             break
         if state_name == "FAILED":
             raise RuntimeError("Gemini failed to process the uploaded audio file.")
+        if on_pulse:
+            on_pulse()
         time.sleep(1)
 
+    ext = Path(media_path).suffix.lower()
+    kind = "video" if ext in VIDEO_EXTENSIONS else "audio"
     lang_hint = f"Language: {language}." if language else "Detect the spoken language."
-    prompt = f"""Transcribe this audio for a course titled "{title}".
+    prompt = f"""Transcribe this {kind} for a course titled "{title}".
 {lang_hint}
 Return ONLY a JSON array (no markdown), each item:
 {{"start": <seconds float>, "end": <seconds float>, "text": "<spoken text>"}}
 Split into natural phrase segments (roughly 5–30 seconds each)."""
 
-    response = client.models.generate_content(
-        model=GEMINI_CHAT_MODEL,
-        contents=[uploaded, prompt],
-    )
+    if on_pulse:
+        on_pulse()
+    response = None
+    last_err = None
+    for attempt in range(2):
+        try:
+            if on_pulse:
+                on_pulse()
+            response = client.models.generate_content(
+                model=GEMINI_CHAT_MODEL,
+                contents=[uploaded, prompt],
+            )
+            break
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_error(e) and attempt == 0:
+                time.sleep(_retry_delay_seconds(e))
+                continue
+            raise RuntimeError(friendly_api_error(e)) from e
+    if response is None:
+        raise RuntimeError(friendly_api_error(last_err or RuntimeError("No response")))
+    if on_pulse:
+        on_pulse()
     raw = (response.text or "").strip()
+    if not raw:
+        raise ValueError("Gemini returned an empty transcript. Try a shorter clip.")
     segments = _parse_json_segments(raw)
 
     chunks = []
@@ -258,9 +477,25 @@ def transcribe_audio(
     title: str,
     *,
     language: str | None = None,
+    on_pulse: Callable[[], None] | None = None,
 ) -> list[dict]:
-    if use_gemini():
-        return transcribe_with_gemini(audio_path, title, language=language)
+    if prefer_groq_transcribe():
+        try:
+            return transcribe_with_groq(audio_path, title, language=language)
+        except Exception as e:
+            if use_gemini() and not groq_primary():
+                pass
+            else:
+                raise RuntimeError(friendly_groq_error(e)) from e
+    if use_gemini() and not groq_primary():
+        try:
+            return transcribe_with_gemini(
+                audio_path, title, language=language, on_pulse=on_pulse
+            )
+        except Exception as e:
+            if _is_rate_limit_error(e) and use_groq():
+                return transcribe_with_groq(audio_path, title, language=language)
+            raise RuntimeError(friendly_api_error(e)) from e
     return transcribe_with_groq(audio_path, title, language=language)
 
 
@@ -295,7 +530,7 @@ def process_uploaded_media(
     ext = Path(filename).suffix.lower()
     is_audio = ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
 
-    provider = "Gemini" if use_gemini() else "Groq"
+    use_groq_path = prefer_groq_transcribe() or not use_gemini()
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -303,20 +538,46 @@ def process_uploaded_media(
         media_path.write_bytes(file_bytes)
 
         if is_audio:
-            step("prepare", "Preparing audio…")
-            audio_path = str(media_path)
+            step("prepare", "Reading your file…")
+            transcribe_path = str(media_path)
+        elif use_groq_path:
+            step("extract", "Getting audio from video…")
+            transcribe_path = str(tmp_path / "audio.mp3")
+            video_to_mp3(str(media_path), transcribe_path)
         else:
-            step("extract", "Extracting audio from video…")
-            audio_path = str(tmp_path / "audio.mp3")
-            video_to_mp3(str(media_path), audio_path)
+            step("prepare", "Uploading video to Gemini…")
+            transcribe_path = str(media_path)
 
-        _check_file_size(Path(audio_path).read_bytes())
-        step("transcribe", f"Transcribing with {provider}…")
-        chunks = transcribe_audio(audio_path, title=title, language=language)
+        _check_file_size(Path(transcribe_path).read_bytes())
+        step("transcribe", "Writing transcript…")
+
+        def pulse() -> None:
+            step("transcribe", "Writing transcript…")
+
+        try:
+            chunks = transcribe_audio(
+                transcribe_path,
+                title=title,
+                language=language,
+                on_pulse=pulse,
+            )
+        except Exception as e:
+            if _is_rate_limit_error(e) and use_groq():
+                step("transcribe", "Gemini limit hit — switching to Groq…")
+                if transcribe_path == str(media_path) and not is_audio:
+                    step("extract", "Extracting audio for Groq…")
+                    transcribe_path = str(tmp_path / "audio.mp3")
+                    video_to_mp3(str(media_path), transcribe_path)
+                chunks = transcribe_with_groq(
+                    transcribe_path, title, language=language
+                )
+            else:
+                raise RuntimeError(friendly_api_error(e)) from e
+
         if not chunks:
             raise ValueError("No speech detected in this file.")
 
-        step("index", f"Building search index ({len(chunks)} segments)…")
+        step("save", "Building search index…")
         return chunks_to_dataframe(chunks)
 
 
@@ -354,12 +615,15 @@ def load_joblib(path: str | Path) -> pd.DataFrame:
 
 
 def build_prompt(query: str, context_df: pd.DataFrame, course_name: str) -> str:
-    records = context_df[["title", "number", "start", "end", "text"]].to_json(orient="records")
+    max_end = float(context_df["end"].max()) if "end" in context_df.columns else 0.0
+    length_hint = format_timestamp(max_end)
+    records = _context_for_prompt(context_df)
     return f"""You are a friendly course teaching assistant for "{course_name}".
-Use the transcript excerpts below. Cite video title and timestamp (MM:SS) when relevant.
+Use the transcript excerpts below. When you mention a moment in the video, cite the exact "at" time from the excerpt (format like 0:27 or 1:05). Never write invalid clock times (seconds must be 00–59). Do not turn decimal seconds into colons (27.83 seconds is 0:27, not 27:83).
+Video length is about {length_hint}. Do not cite times beyond that.
 Be concise and helpful.
 
-Transcript excerpts:
+Transcript excerpts (times are already formatted):
 {records}
 
 Student question: {query}
@@ -369,11 +633,23 @@ If the question is unrelated to the course material, politely decline."""
 
 def _answer_gemini(prompt: str) -> str:
     client = _gemini()
-    response = client.models.generate_content(
-        model=GEMINI_CHAT_MODEL,
-        contents=prompt,
-    )
-    return (response.text or "").strip()
+    last_err = None
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_CHAT_MODEL,
+                contents=prompt,
+            )
+            return (response.text or "").strip()
+        except Exception as e:
+            last_err = e
+            if _is_rate_limit_error(e) and attempt == 0:
+                time.sleep(_retry_delay_seconds(e))
+                continue
+            if _is_rate_limit_error(e) and use_groq():
+                return _answer_groq(prompt)
+            raise
+    raise RuntimeError(friendly_api_error(last_err or RuntimeError("No response")))
 
 
 def _answer_groq(prompt: str) -> str:
@@ -393,10 +669,42 @@ def _answer_groq(prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def generate_answer(prompt: str) -> str:
+def _prefer_groq_chat() -> bool:
+    if not use_groq():
+        return False
+    if groq_primary():
+        return True
+    return os.getenv("PREFER_GROQ_CHAT", "true").lower() in ("1", "true", "yes")
+
+
+def provider_label() -> str:
+    if groq_primary() and use_groq():
+        return "Groq"
     if use_gemini():
-        return _answer_gemini(prompt)
-    return _answer_groq(prompt)
+        return "Gemini"
+    if use_groq():
+        return "Groq"
+    return "not configured"
+
+
+def generate_answer(prompt: str) -> str:
+    text = ""
+    if _prefer_groq_chat() and use_groq():
+        try:
+            text = _answer_groq(prompt)
+        except Exception:
+            text = ""
+    if not text and use_gemini():
+        try:
+            text = _answer_gemini(prompt)
+        except Exception as e:
+            if use_groq():
+                text = _answer_groq(prompt)
+            else:
+                raise RuntimeError(friendly_api_error(e)) from e
+    if not text:
+        text = _answer_groq(prompt)
+    return fix_timestamps_in_text(text)
 
 
 def _fallback_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
