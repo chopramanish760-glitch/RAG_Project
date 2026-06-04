@@ -6,6 +6,7 @@ __pycache__/
 .DS_Store
 audios/
 videos/
+jsons/
 *.joblib
 prompt.txt
 response.txt

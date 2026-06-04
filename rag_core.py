@@ -280,12 +280,14 @@ def process_uploaded_media(
     file_bytes: bytes,
     filename: str,
     *,
-    on_step: Callable[[str], None] | None = None,
+    on_step: Callable[[str, str], None] | None = None,
     language: str | None = None,
 ) -> pd.DataFrame:
-    def step(msg: str) -> None:
+    """Process media. on_step(stage, message) with stages: prepare|extract|transcribe|index."""
+
+    def step(stage: str, msg: str) -> None:
         if on_step:
-            on_step(msg)
+            on_step(stage, msg)
 
     require_api_key()
     _check_file_size(file_bytes)
@@ -301,21 +303,31 @@ def process_uploaded_media(
         media_path.write_bytes(file_bytes)
 
         if is_audio:
-            step("Preparing audio…")
+            step("prepare", "Preparing audio…")
             audio_path = str(media_path)
         else:
-            step("Extracting audio…")
+            step("extract", "Extracting audio from video…")
             audio_path = str(tmp_path / "audio.mp3")
             video_to_mp3(str(media_path), audio_path)
 
         _check_file_size(Path(audio_path).read_bytes())
-        step(f"Transcribing with {provider}…")
+        step("transcribe", f"Transcribing with {provider}…")
         chunks = transcribe_audio(audio_path, title=title, language=language)
         if not chunks:
             raise ValueError("No speech detected in this file.")
 
-        step(f"Indexing {len(chunks)} segments…")
+        step("index", f"Building search index ({len(chunks)} segments)…")
         return chunks_to_dataframe(chunks)
+
+
+def estimate_processing_seconds(file_bytes: bytes, filename: str) -> int:
+    """Rough ETA from file size (not exact)."""
+    ext = Path(filename).suffix.lower()
+    is_video = ext not in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
+    mb = len(file_bytes) / (1024 * 1024)
+    base = 25 if is_video else 15
+    per_mb = 10 if use_gemini() else 6
+    return int(base + mb * per_mb)
 
 
 def merge_dataframes(existing: pd.DataFrame | None, new_df: pd.DataFrame) -> pd.DataFrame:
@@ -385,6 +397,71 @@ def generate_answer(prompt: str) -> str:
     if use_gemini():
         return _answer_gemini(prompt)
     return _answer_groq(prompt)
+
+
+def _fallback_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
+    titles = [str(t) for t in df["title"].dropna().unique().tolist()]
+    questions = [
+        "Summarize all videos in this course",
+        "What are the main topics covered across all lessons?",
+    ]
+    for title in titles[: max(0, count - 2)]:
+        questions.append(f"What is explained in \"{title}\"?")
+    if len(titles) > 1:
+        questions.append("Which video should I start with and why?")
+    if len(titles) >= 2:
+        questions.append("Where are the most important concepts taught with timestamps?")
+    return questions[:count]
+
+
+def build_suggested_questions(
+    df: pd.DataFrame,
+    *,
+    course_name: str = "My course",
+    count: int = 5,
+) -> list[str]:
+    """Generate short question suggestions from indexed transcript."""
+    if df is None or df.empty:
+        return _fallback_suggested_questions(
+            pd.DataFrame({"title": ["course"], "text": [""]}), count
+        )
+
+    titles = df["title"].dropna().unique().tolist()[:6]
+    sample_rows = df.head(25)
+    lines = []
+    for _, row in sample_rows.iterrows():
+        lines.append(f"[{row.get('title', 'Lesson')}] {str(row.get('text', ''))[:120]}")
+    excerpt = "\n".join(lines)[:3500]
+    title_list = ", ".join(str(t) for t in titles)
+
+    prompt = f"""Course: "{course_name}"
+Videos: {title_list}
+
+Transcript samples:
+{excerpt}
+
+Write exactly {count} short questions a student would ask about THIS content.
+Each question under 12 words. Reference actual topics from the transcript.
+Return ONLY a JSON array of strings, no markdown.
+
+Example: ["What is HTML?", "Where is CSS introduced?"]"""
+
+    try:
+        raw = generate_answer(prompt)
+        text = raw.strip()
+        if "```" in text:
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+            if match:
+                text = match.group(1).strip()
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            cleaned = [str(q).strip() for q in parsed if str(q).strip()]
+            if cleaned:
+                return cleaned[:count]
+    except (json.JSONDecodeError, TypeError, RuntimeError):
+        pass
+
+    return _fallback_suggested_questions(df, count)
 
 
 def answer_question(
