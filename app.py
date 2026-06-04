@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import threading
 import time
-from datetime import timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -176,13 +174,34 @@ def sync_active_context() -> None:
                 "content": f"Now asking about **Video {v['num']}** — {short_name(v['name'])}.",
             }
         )
+    elif st.session_state.processing_video_num == num:
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": (
+                    f"**Video {v['num']}** is processing. "
+                    f"Switch to a **Ready** video to chat and see suggested questions."
+                ),
+            }
+        )
     elif any(p.get("video_num") == num for p in st.session_state.pending_queue):
         st.session_state.messages.append(
             {
                 "role": "assistant",
-                "content": f"**Video {v['num']}** is queued. It will process when you continue.",
+                "content": (
+                    f"**Video {v['num']}** is waiting. "
+                    f'Click **Start Video {v["num"]}** below, or pick a **Ready** video.'
+                ),
             }
         )
+
+
+def ensure_active_suggestions() -> None:
+    v = active_video()
+    if v and v.get("ready"):
+        qs = v.get("suggested_questions") or []
+        if qs and not st.session_state.suggested_questions:
+            st.session_state.suggested_questions = list(qs)
 
 
 def file_sig(name: str, data: bytes) -> tuple:
@@ -196,11 +215,6 @@ def reset_chat() -> None:
     st.session_state.suggested_questions = []
 
 
-# Background transcription (so a ready video stays usable while another processes)
-_BG_LOCK = threading.Lock()
-_BG: dict = {"status": None, "stage": "prepare", "message": "Starting…"}
-
-
 def reset_lesson_state() -> None:
     """Drop all videos and chat."""
     reset_chat()
@@ -212,8 +226,6 @@ def reset_lesson_state() -> None:
     st.session_state._last_active_num = None
     st.session_state.processing_video_num = None
     st.session_state.is_processing = False
-    with _BG_LOCK:
-        _BG["status"] = None
 
 
 def can_chat() -> bool:
@@ -223,12 +235,6 @@ def can_chat() -> bool:
         return True
     proc = st.session_state.processing_video_num
     return proc is None or proc != st.session_state.active_video_num
-
-
-def _bg_on_step(stage: str, msg: str) -> None:
-    with _BG_LOCK:
-        _BG["stage"] = stage
-        _BG["message"] = msg
 
 
 def _process_item_core(
@@ -270,40 +276,6 @@ def _apply_process_result(result: dict) -> None:
         st.session_state.suggested_questions = result["questions"]
 
 
-def _bg_worker(item: dict) -> None:
-    try:
-        result = _process_item_core(item, on_step=_bg_on_step)
-        with _BG_LOCK:
-            if _BG.get("cancelled"):
-                _BG["status"] = None
-                return
-            _BG["status"] = "done"
-            _BG["result"] = result
-    except Exception as e:
-        with _BG_LOCK:
-            if not _BG.get("cancelled"):
-                _BG["status"] = "error"
-                _BG["error"] = str(e)
-                _BG["failed_item"] = item
-    finally:
-        with _BG_LOCK:
-            if _BG.get("status") == "running":
-                _BG["status"] = "error"
-                _BG["error"] = "Processing stopped unexpectedly. Click Reset and try again."
-                _BG["failed_item"] = item
-
-
-def cancel_background_job() -> None:
-    with _BG_LOCK:
-        _BG["cancelled"] = True
-        if _BG.get("status") == "running":
-            _BG["status"] = None
-    st.session_state.is_processing = False
-    st.session_state.processing_video_num = None
-    st.session_state.proc_started_at = None
-    st.session_state.proc_eta = None
-
-
 def remove_video(num: int) -> None:
     """Remove a video from the library (uploader × or cancel)."""
     v = get_video(num)
@@ -311,7 +283,8 @@ def remove_video(num: int) -> None:
         return
     sig = v["sig"]
     if st.session_state.processing_video_num == num:
-        cancel_background_job()
+        st.session_state.is_processing = False
+        st.session_state.processing_video_num = None
     st.session_state.videos = [x for x in st.session_state.videos if x["num"] != num]
     st.session_state.pending_queue = [
         p for p in st.session_state.pending_queue if p.get("video_num") != num
@@ -333,23 +306,37 @@ def sync_uploader_catalog(uploaded_files: list) -> None:
             remove_video(v["num"])
 
 
-def start_background_process(item: dict) -> None:
-    with _BG_LOCK:
-        if _BG.get("status") == "running":
-            return
-        _BG["status"] = "running"
-        _BG["cancelled"] = False
-        _BG["result"] = None
-        _BG["error"] = None
-        _BG["stage"] = "prepare"
-        _BG["message"] = "Starting…"
-    st.session_state.is_processing = True
-    st.session_state.processing_video_num = item["video_num"]
-    st.session_state.proc_started_at = time.time()
-    st.session_state.proc_eta = max(
-        60, rag_core.estimate_processing_seconds(item["bytes"], item["name"])
-    )
-    threading.Thread(target=_bg_worker, args=(item,), daemon=True).start()
+def pending_item_for_num(num: int) -> dict | None:
+    for p in st.session_state.pending_queue:
+        if p.get("video_num") == num:
+            return p
+    return None
+
+
+def render_queued_start_buttons() -> None:
+    if st.session_state.is_processing:
+        return
+    queued = [
+        v
+        for v in sorted(st.session_state.videos, key=lambda x: x["num"])
+        if not v.get("ready")
+        and pending_item_for_num(v["num"]) is not None
+    ]
+    if not queued:
+        return
+    st.caption("Other videos waiting")
+    cols = st.columns(min(3, len(queued)))
+    for i, v in enumerate(queued):
+        with cols[i % len(cols)]:
+            if st.button(
+                f"Start Video {v['num']}",
+                key=f"start_v{v['num']}",
+                use_container_width=True,
+            ):
+                item = pending_item_for_num(v["num"])
+                if item:
+                    st.session_state.active_video_num = v["num"]
+                    process_queue(item)
 
 
 def render_processing_panel() -> None:
@@ -363,10 +350,10 @@ def render_processing_panel() -> None:
     eta = int(st.session_state.get("proc_eta") or 120)
     elapsed = max(0, int(time.time() - started))
     remaining = max(0, eta - elapsed)
+    time_label = fmt_time(remaining) if remaining > 0 else "Still working…"
 
-    with _BG_LOCK:
-        stage = _BG.get("stage", "transcribe")
-        msg = _BG.get("message", "Working…")
+    stage = st.session_state.get("proc_stage", "transcribe")
+    msg = st.session_state.get("proc_message", "Working…")
     label = STEP_LABEL.get(stage, stage)
     pct = STEP_PCT.get(stage, 0.5)
 
@@ -379,7 +366,7 @@ def render_processing_panel() -> None:
     st.markdown(
         f'<div class="timer-box">'
         f'<div style="color:#64748b;font-size:14px;">Video {proc_num} · {label}</div>'
-        f'<div class="timer-big">{fmt_time(remaining)}</div>'
+        f'<div class="timer-big">{time_label}</div>'
         f'<div style="color:#94a3b8;font-size:12px;">estimated left · elapsed {fmt_time(elapsed)}</div>'
         f"</div>",
         unsafe_allow_html=True,
@@ -390,67 +377,14 @@ def render_processing_panel() -> None:
         st.rerun()
 
 
-def poll_background_job() -> None:
-    with _BG_LOCK:
-        status = _BG.get("status")
-        if status not in ("done", "error"):
-            return
-        cancelled = bool(_BG.get("cancelled"))
-        if status == "done":
-            result = _BG["result"]
-            _BG["status"] = None
-        else:
-            err = _BG["error"]
-            item = _BG.get("failed_item", {})
-            _BG["status"] = None
-
-    st.session_state.is_processing = False
-    st.session_state.processing_video_num = None
-    st.session_state.proc_started_at = None
-    st.session_state.proc_eta = None
-
-    if status == "done":
-        num = result["num"]
-        if cancelled or get_video(num) is None:
-            st.rerun()
-            return
-        _apply_process_result(result)
-        if st.session_state.active_video_num == num:
-            reset_chat()
-            st.session_state._last_active_num = num
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"**Video {num}** is ready. Ask below.",
-                }
-            )
-        st.rerun()
-    else:
-        num = item.get("video_num", "?")
-        name = item.get("name", "")
-        st.session_state.last_error = f"**Video {num}** ({short_name(name)}): {err}"
-        for v in st.session_state.videos:
-            if v["num"] == num:
-                v["error"] = err
-                break
-        st.session_state.pending_queue = [
-            p for p in st.session_state.pending_queue if p.get("sig") != item.get("sig")
-        ]
-        st.rerun()
-
-
 def kickoff_pending_work() -> None:
-    """Start the next queued video — in background if another video is already ready."""
-    poll_background_job()
+    """Auto-start only when no video is ready yet (first upload batch)."""
     if st.session_state.is_processing or not st.session_state.pending_queue:
         return
-    item = pick_pending_item()
-    if not item:
+    if any_video_ready():
         return
-    active = active_video()
-    if active and active.get("ready") and item["video_num"] != active["num"]:
-        start_background_process(item)
-    else:
+    item = pick_pending_item()
+    if item:
         process_queue(item)
 
 
@@ -576,6 +510,7 @@ def process_queue(item: dict) -> None:
     def refresh_ui(stage: str, msg: str) -> None:
         elapsed = time.time() - batch_start
         remaining = max(0, int(batch_eta - elapsed))
+        time_label = fmt_time(remaining) if remaining > 0 else "Still working…"
         pct = STEP_PCT.get(stage, 0.5)
         label_step = STEP_LABEL.get(stage, stage)
         progress.progress(min(0.98, pct), text=f"Video {num} · {label_step}")
@@ -583,7 +518,7 @@ def process_queue(item: dict) -> None:
         timer_box.markdown(
             f'<div class="timer-box">'
             f'<div style="color:#64748b;font-size:14px;">Video {num} · {label_step}</div>'
-            f'<div class="timer-big">{fmt_time(remaining)}</div>'
+            f'<div class="timer-big">{time_label}</div>'
             f'<div style="color:#94a3b8;font-size:12px;">estimated time left · elapsed {fmt_time(int(elapsed))}</div>'
             f"</div>",
             unsafe_allow_html=True,
@@ -592,10 +527,12 @@ def process_queue(item: dict) -> None:
     refresh_ui("prepare", "Starting…")
 
     def on_step(stage: str, msg: str) -> None:
+        st.session_state.proc_stage = stage
+        st.session_state.proc_message = msg
         refresh_ui(stage, msg)
 
     try:
-        result = _process_item_core(item)
+        result = _process_item_core(item, on_step=on_step)
         _apply_process_result(result)
         questions = result["questions"]
         elapsed = max(1, int(time.time() - batch_start))
@@ -725,6 +662,7 @@ if st.session_state.videos:
         st.session_state.active_video_num = picked
         st.rerun()
     sync_active_context()
+    ensure_active_suggestions()
 
 active = active_video()
 if active and active.get("ready"):
@@ -733,16 +671,12 @@ if active and active.get("ready"):
         unsafe_allow_html=True,
     )
 elif any_video_ready():
-    st.info("Selected video is not ready yet. Pick a **Ready** video or wait for processing.")
+    st.info("Pick a **Ready** video above to chat and see suggested questions.")
 
-@st.fragment(run_every=timedelta(seconds=2))
-def _processing_poll_panel() -> None:
-    if st.session_state.is_processing and st.session_state.processing_video_num:
-        poll_background_job()
+render_queued_start_buttons()
+
+if st.session_state.is_processing:
     render_processing_panel()
-
-
-_processing_poll_panel()
 
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
@@ -751,7 +685,14 @@ for i, msg in enumerate(st.session_state.messages):
             with st.expander("Sources"):
                 st.markdown(st.session_state.sources[str(i)])
 
-if active_df() is not None and st.session_state.suggested_questions:
+if (
+    active_df() is not None
+    and st.session_state.suggested_questions
+    and not (
+        st.session_state.is_processing
+        and st.session_state.processing_video_num == st.session_state.active_video_num
+    )
+):
     st.markdown("##### Tap a question")
     cols = st.columns(2)
     busy = not can_chat()
