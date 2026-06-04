@@ -8,6 +8,7 @@ import threading
 import time
 from datetime import timedelta
 from pathlib import Path
+from typing import Callable
 
 # Quiet Hugging Face cache warning on Windows (first FastEmbed download)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -197,7 +198,7 @@ def reset_chat() -> None:
 
 # Background transcription (so a ready video stays usable while another processes)
 _BG_LOCK = threading.Lock()
-_BG: dict = {"status": None}
+_BG: dict = {"status": None, "stage": "prepare", "message": "Starting…"}
 
 
 def reset_lesson_state() -> None:
@@ -224,14 +225,23 @@ def can_chat() -> bool:
     return proc is None or proc != st.session_state.active_video_num
 
 
-def _process_item_core(item: dict) -> dict:
+def _bg_on_step(stage: str, msg: str) -> None:
+    with _BG_LOCK:
+        _BG["stage"] = stage
+        _BG["message"] = msg
+
+
+def _process_item_core(
+    item: dict,
+    on_step: Callable[[str, str], None] | None = None,
+) -> dict:
     num = item["video_num"]
     name = item["name"]
     data = item["bytes"]
     sig = item["sig"]
     label = f"Video {num}"
     new_df = rag_core.process_uploaded_media(
-        data, name, language=None, video_label=label
+        data, name, language=None, video_label=label, on_step=on_step
     )
     questions = rag_core.build_suggested_questions(new_df, count=5)
     return {
@@ -262,15 +272,65 @@ def _apply_process_result(result: dict) -> None:
 
 def _bg_worker(item: dict) -> None:
     try:
-        result = _process_item_core(item)
+        result = _process_item_core(item, on_step=_bg_on_step)
         with _BG_LOCK:
+            if _BG.get("cancelled"):
+                _BG["status"] = None
+                return
             _BG["status"] = "done"
             _BG["result"] = result
     except Exception as e:
         with _BG_LOCK:
-            _BG["status"] = "error"
-            _BG["error"] = str(e)
-            _BG["failed_item"] = item
+            if not _BG.get("cancelled"):
+                _BG["status"] = "error"
+                _BG["error"] = str(e)
+                _BG["failed_item"] = item
+    finally:
+        with _BG_LOCK:
+            if _BG.get("status") == "running":
+                _BG["status"] = "error"
+                _BG["error"] = "Processing stopped unexpectedly. Click Reset and try again."
+                _BG["failed_item"] = item
+
+
+def cancel_background_job() -> None:
+    with _BG_LOCK:
+        _BG["cancelled"] = True
+        if _BG.get("status") == "running":
+            _BG["status"] = None
+    st.session_state.is_processing = False
+    st.session_state.processing_video_num = None
+    st.session_state.proc_started_at = None
+    st.session_state.proc_eta = None
+
+
+def remove_video(num: int) -> None:
+    """Remove a video from the library (uploader × or cancel)."""
+    v = get_video(num)
+    if not v:
+        return
+    sig = v["sig"]
+    if st.session_state.processing_video_num == num:
+        cancel_background_job()
+    st.session_state.videos = [x for x in st.session_state.videos if x["num"] != num]
+    st.session_state.pending_queue = [
+        p for p in st.session_state.pending_queue if p.get("video_num") != num
+    ]
+    st.session_state.done_sigs.discard(sig)
+    if st.session_state.active_video_num == num:
+        if st.session_state.videos:
+            st.session_state.active_video_num = st.session_state.videos[0]["num"]
+            st.session_state._last_active_num = None
+        else:
+            st.session_state.active_video_num = 1
+
+
+def sync_uploader_catalog(uploaded_files: list) -> None:
+    """Drop videos removed from the file uploader (× on chip)."""
+    current_sigs = {file_sig(f.name, f.getvalue()) for f in uploaded_files}
+    for v in list(st.session_state.videos):
+        if v["sig"] not in current_sigs:
+            remove_video(v["num"])
 
 
 def start_background_process(item: dict) -> None:
@@ -278,11 +338,56 @@ def start_background_process(item: dict) -> None:
         if _BG.get("status") == "running":
             return
         _BG["status"] = "running"
+        _BG["cancelled"] = False
         _BG["result"] = None
         _BG["error"] = None
+        _BG["stage"] = "prepare"
+        _BG["message"] = "Starting…"
     st.session_state.is_processing = True
     st.session_state.processing_video_num = item["video_num"]
+    st.session_state.proc_started_at = time.time()
+    st.session_state.proc_eta = max(
+        60, rag_core.estimate_processing_seconds(item["bytes"], item["name"])
+    )
     threading.Thread(target=_bg_worker, args=(item,), daemon=True).start()
+
+
+def render_processing_panel() -> None:
+    proc_num = st.session_state.processing_video_num
+    if not st.session_state.is_processing or not proc_num:
+        return
+
+    pv = get_video(proc_num)
+    pname = short_name(pv["name"]) if pv else ""
+    started = st.session_state.get("proc_started_at") or time.time()
+    eta = int(st.session_state.get("proc_eta") or 120)
+    elapsed = max(0, int(time.time() - started))
+    remaining = max(0, eta - elapsed)
+
+    with _BG_LOCK:
+        stage = _BG.get("stage", "transcribe")
+        msg = _BG.get("message", "Working…")
+    label = STEP_LABEL.get(stage, stage)
+    pct = STEP_PCT.get(stage, 0.5)
+
+    st.markdown(f"#### Processing **Video {proc_num}**")
+    st.caption(
+        f"{pname} — you can chat with other **Ready** videos. "
+        f"Remove the file with **×** to cancel."
+    )
+    st.progress(min(0.98, pct), text=f"Video {proc_num} · {label}")
+    st.markdown(
+        f'<div class="timer-box">'
+        f'<div style="color:#64748b;font-size:14px;">Video {proc_num} · {label}</div>'
+        f'<div class="timer-big">{fmt_time(remaining)}</div>'
+        f'<div style="color:#94a3b8;font-size:12px;">estimated left · elapsed {fmt_time(elapsed)}</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(f"**Video {proc_num}** — {msg}")
+    if st.button(f"Cancel Video {proc_num}", key=f"cancel_proc_{proc_num}"):
+        remove_video(proc_num)
+        st.rerun()
 
 
 def poll_background_job() -> None:
@@ -290,6 +395,7 @@ def poll_background_job() -> None:
         status = _BG.get("status")
         if status not in ("done", "error"):
             return
+        cancelled = bool(_BG.get("cancelled"))
         if status == "done":
             result = _BG["result"]
             _BG["status"] = None
@@ -300,10 +406,15 @@ def poll_background_job() -> None:
 
     st.session_state.is_processing = False
     st.session_state.processing_video_num = None
+    st.session_state.proc_started_at = None
+    st.session_state.proc_eta = None
 
     if status == "done":
-        _apply_process_result(result)
         num = result["num"]
+        if cancelled or get_video(num) is None:
+            st.rerun()
+            return
+        _apply_process_result(result)
         if st.session_state.active_video_num == num:
             reset_chat()
             st.session_state._last_active_num = num
@@ -452,7 +563,9 @@ def process_queue(item: dict) -> None:
     st.session_state.active_video_num = num
 
     batch_eta = max(60, rag_core.estimate_processing_seconds(item["bytes"], name))
-    batch_start = time.time()
+    st.session_state.proc_started_at = time.time()
+    st.session_state.proc_eta = batch_eta
+    batch_start = st.session_state.proc_started_at
 
     st.markdown(f"#### Processing **Video {num}**")
     st.caption(f"{short_name(name)} · you can use other **Ready** videos once processing finishes.")
@@ -521,6 +634,8 @@ def process_queue(item: dict) -> None:
     finally:
         st.session_state.is_processing = False
         st.session_state.processing_video_num = None
+        st.session_state.proc_started_at = None
+        st.session_state.proc_eta = None
 
 
 # --- API ---
@@ -554,11 +669,14 @@ uploaded = st.file_uploader(
     label_visibility="collapsed",
     key="video_uploader",
 )
-if uploaded:
-    if len(uploaded) > MAX_VIDEOS:
+upload_list = list(uploaded) if uploaded else []
+sync_uploader_catalog(upload_list)
+
+if upload_list:
+    if len(upload_list) > MAX_VIDEOS:
         st.warning(f"Only the first {MAX_VIDEOS} files are used.")
     valid_uploads = []
-    for f in uploaded[:MAX_VIDEOS]:
+    for f in upload_list[:MAX_VIDEOS]:
         size_mb = len(f.getvalue()) / (1024 * 1024)
         if size_mb > MAX_UPLOAD_MB:
             st.error(
@@ -617,22 +735,14 @@ if active and active.get("ready"):
 elif any_video_ready():
     st.info("Selected video is not ready yet. Pick a **Ready** video or wait for processing.")
 
-proc_num = st.session_state.processing_video_num
-if st.session_state.is_processing and proc_num:
-    pv = get_video(proc_num)
-    pname = short_name(pv["name"]) if pv else ""
-    st.info(
-        f"Processing **Video {proc_num}** ({pname}) in the background. "
-        f"You can keep chatting with other **Ready** videos."
-    )
-
 @st.fragment(run_every=timedelta(seconds=2))
-def _poll_background_job() -> None:
+def _processing_poll_panel() -> None:
     if st.session_state.is_processing and st.session_state.processing_video_num:
         poll_background_job()
+    render_processing_panel()
 
 
-_poll_background_job()
+_processing_poll_panel()
 
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
@@ -656,7 +766,7 @@ if (
     active_df() is None
     and not st.session_state.pending_queue
     and not st.session_state.is_processing
-    and not uploaded
+    and not upload_list
 ):
     st.info("Drop a video above — processing starts automatically.")
 
