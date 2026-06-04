@@ -48,8 +48,7 @@ AI_PROVIDER = "groq"
 GROQ_API_KEY = "your_groq_key_here"
 PREFER_GROQ_TRANSCRIBE = "true"
 PREFER_GROQ_CHAT = "true"
-COURSE_NAME = "Sigma Web Development"
-MAX_UPLOAD_MB = "24"
+MAX_UPLOAD_MB = "25"
 ```
 
 Optional fallback:

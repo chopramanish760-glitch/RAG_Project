@@ -26,7 +26,7 @@ GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "100"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
 
 _embedder = None
 _groq_client = None
@@ -83,8 +83,8 @@ def _retry_delay_seconds(exc: Exception, default: int = 45) -> int:
 def friendly_groq_error(exc: Exception) -> str:
     msg = str(exc).lower()
     if "429" in msg or "rate" in msg or "quota" in msg:
-        return "Groq rate limit reached. Wait about a minute, then click **Try again**."
-    return f"Groq error: {exc}"
+        return "API rate limit reached. Wait about a minute, then click **Try again**."
+    return f"Transcription error: {exc}"
 
 
 def friendly_api_error(exc: Exception) -> str:
@@ -92,15 +92,12 @@ def friendly_api_error(exc: Exception) -> str:
         wait = _retry_delay_seconds(exc)
         extra = ""
         if use_groq():
-            extra = " The app will try Groq automatically if configured."
+            extra = " A backup API key in `.env` can help when limits are hit."
         else:
-            extra = (
-                " Add a free **GROQ_API_KEY** in `.env` (https://console.groq.com/keys) "
-                "so transcription can continue when Gemini is busy."
-            )
+            extra = " Add a backup API key in `.env` or Streamlit Secrets."
         return (
-            f"Gemini free-tier limit reached. Wait about **{wait} seconds**, then click "
-            f"**Try again**. Check usage: https://ai.google.dev/gemini-api/docs/rate-limits.{extra}"
+            f"API rate limit reached. Wait about **{wait} seconds**, then click "
+            f"**Try again**.{extra}"
         )
     return str(exc)
 
@@ -293,8 +290,11 @@ def video_to_mp3(video_path: str, mp3_path: str) -> None:
             text=True,
         )
     except subprocess.CalledProcessError as e:
-        err = (e.stderr or e.stdout or str(e))[:200]
-        raise RuntimeError(f"Could not extract audio from video. {err}") from e
+        err = (e.stderr or e.stdout or str(e)).lower()
+        if "does not contain any stream" in err or "no audio" in err or "invalid argument" in err:
+            raise ValueError(NO_AUDIO_MESSAGE) from e
+        snippet = (e.stderr or e.stdout or str(e))[:200]
+        raise RuntimeError(f"Could not extract audio from video. {snippet}") from e
 
 
 def _safe_title(name: str) -> str:
@@ -303,12 +303,52 @@ def _safe_title(name: str) -> str:
     return stem.strip() or "Uploaded video"
 
 
+NO_AUDIO_MESSAGE = (
+    "No audio found in this file. Please upload a video or audio file with speech."
+)
+UNREADABLE_AUDIO_MESSAGE = (
+    "Could not read the audio. Please upload a clearer recording with spoken words."
+)
+
+
 def _check_file_size(file_bytes: bytes) -> None:
     size_mb = len(file_bytes) / (1024 * 1024)
     if size_mb > MAX_UPLOAD_MB:
         raise ValueError(
             f"File is {size_mb:.1f} MB (limit {MAX_UPLOAD_MB} MB). Use a shorter or compressed file."
         )
+
+
+def _ensure_usable_audio(audio_path: str) -> None:
+    path = Path(audio_path)
+    if not path.exists() or path.stat().st_size < 800:
+        raise ValueError(NO_AUDIO_MESSAGE)
+
+
+def _strip_noise_tags(text: str) -> str:
+    cleaned = re.sub(r"\[[^\]]*\]", " ", text)
+    cleaned = re.sub(r"\([^)]*\)", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _validate_transcript(chunks: list[dict]) -> list[dict]:
+    """Keep only chunks with text; fail clearly when audio is missing or unreadable."""
+    kept = [
+        c
+        for c in chunks
+        if _strip_noise_tags(str(c.get("text", "")))
+    ]
+    if not kept:
+        combined = " ".join(str(c.get("text", "")) for c in chunks).strip()
+        if not combined:
+            raise ValueError(NO_AUDIO_MESSAGE)
+        raise ValueError(UNREADABLE_AUDIO_MESSAGE)
+
+    combined = " ".join(_strip_noise_tags(str(c.get("text", ""))) for c in kept)
+    words = re.findall(r"\w{2,}", combined, flags=re.UNICODE)
+    if len(words) < 2:
+        raise ValueError(UNREADABLE_AUDIO_MESSAGE)
+    return kept
 
 
 def _parse_json_segments(text: str) -> list[dict]:
@@ -404,7 +444,7 @@ Split into natural phrase segments (roughly 5–30 seconds each)."""
         on_pulse()
     raw = (response.text or "").strip()
     if not raw:
-        raise ValueError("Gemini returned an empty transcript. Try a shorter clip.")
+        raise ValueError(UNREADABLE_AUDIO_MESSAGE)
     segments = _parse_json_segments(raw)
 
     chunks = []
@@ -421,7 +461,7 @@ Split into natural phrase segments (roughly 5–30 seconds each)."""
                 "text": text,
             }
         )
-    return chunks
+    return _validate_transcript(chunks)
 
 
 def transcribe_with_groq(
@@ -446,7 +486,7 @@ def transcribe_with_groq(
     segments = data.get("segments") or []
 
     if segments:
-        return [
+        chunks = [
             {
                 "number": "upload",
                 "title": title,
@@ -457,19 +497,22 @@ def transcribe_with_groq(
             for seg in segments
             if (seg.get("text") or "").strip()
         ]
+        return _validate_transcript(chunks)
 
     full_text = (data.get("text") or "").strip()
     if not full_text:
-        return []
-    return [
-        {
-            "number": "upload",
-            "title": title,
-            "start": 0.0,
-            "end": 0.0,
-            "text": full_text,
-        }
-    ]
+        raise ValueError(NO_AUDIO_MESSAGE)
+    return _validate_transcript(
+        [
+            {
+                "number": "upload",
+                "title": title,
+                "start": 0.0,
+                "end": 0.0,
+                "text": full_text,
+            }
+        ]
+    )
 
 
 def transcribe_audio(
@@ -517,6 +560,7 @@ def process_uploaded_media(
     *,
     on_step: Callable[[str, str], None] | None = None,
     language: str | None = None,
+    video_label: str | None = None,
 ) -> pd.DataFrame:
     """Process media. on_step(stage, message) with stages: prepare|extract|transcribe|index."""
 
@@ -526,7 +570,7 @@ def process_uploaded_media(
 
     require_api_key()
     _check_file_size(file_bytes)
-    title = _safe_title(filename)
+    title = video_label or _safe_title(filename)
     ext = Path(filename).suffix.lower()
     is_audio = ext in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
 
@@ -545,10 +589,11 @@ def process_uploaded_media(
             transcribe_path = str(tmp_path / "audio.mp3")
             video_to_mp3(str(media_path), transcribe_path)
         else:
-            step("prepare", "Uploading video to Gemini…")
+            step("prepare", "Uploading video for transcription…")
             transcribe_path = str(media_path)
 
         _check_file_size(Path(transcribe_path).read_bytes())
+        _ensure_usable_audio(transcribe_path)
         step("transcribe", "Writing transcript…")
 
         def pulse() -> None:
@@ -563,9 +608,9 @@ def process_uploaded_media(
             )
         except Exception as e:
             if _is_rate_limit_error(e) and use_groq():
-                step("transcribe", "Gemini limit hit — switching to Groq…")
+                step("transcribe", "Switching to backup transcription…")
                 if transcribe_path == str(media_path) and not is_audio:
-                    step("extract", "Extracting audio for Groq…")
+                    step("extract", "Extracting audio…")
                     transcribe_path = str(tmp_path / "audio.mp3")
                     video_to_mp3(str(media_path), transcribe_path)
                 chunks = transcribe_with_groq(
@@ -574,8 +619,7 @@ def process_uploaded_media(
             else:
                 raise RuntimeError(friendly_api_error(e)) from e
 
-        if not chunks:
-            raise ValueError("No speech detected in this file.")
+        chunks = _validate_transcript(chunks)
 
         step("save", "Building search index…")
         return chunks_to_dataframe(chunks)
@@ -614,11 +658,11 @@ def load_joblib(path: str | Path) -> pd.DataFrame:
     return df
 
 
-def build_prompt(query: str, context_df: pd.DataFrame, course_name: str) -> str:
+def build_prompt(query: str, context_df: pd.DataFrame) -> str:
     max_end = float(context_df["end"].max()) if "end" in context_df.columns else 0.0
     length_hint = format_timestamp(max_end)
     records = _context_for_prompt(context_df)
-    return f"""You are a friendly course teaching assistant for "{course_name}".
+    return f"""You are a friendly tutor for the uploaded video lesson.
 Use the transcript excerpts below. When you mention a moment in the video, cite the exact "at" time from the excerpt (format like 0:27 or 1:05). Never write invalid clock times (seconds must be 00–59). Do not turn decimal seconds into colons (27.83 seconds is 0:27, not 27:83).
 Video length is about {length_hint}. Do not cite times beyond that.
 Be concise and helpful.
@@ -628,7 +672,7 @@ Transcript excerpts (times are already formatted):
 
 Student question: {query}
 
-If the question is unrelated to the course material, politely decline."""
+If the question is unrelated to the video, politely decline."""
 
 
 def _answer_gemini(prompt: str) -> str:
@@ -659,7 +703,7 @@ def _answer_groq(prompt: str) -> str:
         messages=[
             {
                 "role": "system",
-                "content": "You help students navigate course videos using transcript search results.",
+                "content": "You help students learn from uploaded lesson videos using transcript search results.",
             },
             {"role": "user", "content": prompt},
         ],
@@ -675,16 +719,6 @@ def _prefer_groq_chat() -> bool:
     if groq_primary():
         return True
     return os.getenv("PREFER_GROQ_CHAT", "true").lower() in ("1", "true", "yes")
-
-
-def provider_label() -> str:
-    if groq_primary() and use_groq():
-        return "Groq"
-    if use_gemini():
-        return "Gemini"
-    if use_groq():
-        return "Groq"
-    return "not configured"
 
 
 def generate_answer(prompt: str) -> str:
@@ -710,8 +744,8 @@ def generate_answer(prompt: str) -> str:
 def _fallback_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
     titles = [str(t) for t in df["title"].dropna().unique().tolist()]
     questions = [
-        "Summarize all videos in this course",
-        "What are the main topics covered across all lessons?",
+        "Summarize what this video covers",
+        "What are the main topics in these lessons?",
     ]
     for title in titles[: max(0, count - 2)]:
         questions.append(f"What is explained in \"{title}\"?")
@@ -725,7 +759,6 @@ def _fallback_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
 def build_suggested_questions(
     df: pd.DataFrame,
     *,
-    course_name: str = "My course",
     count: int = 5,
 ) -> list[str]:
     """Generate short question suggestions from indexed transcript."""
@@ -742,8 +775,7 @@ def build_suggested_questions(
     excerpt = "\n".join(lines)[:3500]
     title_list = ", ".join(str(t) for t in titles)
 
-    prompt = f"""Course: "{course_name}"
-Videos: {title_list}
+    prompt = f"""Videos: {title_list}
 
 Transcript samples:
 {excerpt}
@@ -772,11 +804,56 @@ Example: ["What is HTML?", "Where is CSS introduced?"]"""
     return _fallback_suggested_questions(df, count)
 
 
+def _query_video_scores(videos: list[dict], query: str) -> list[tuple[int, float, str]]:
+    """Best similarity score per ready video for a question."""
+    q_emb = create_embeddings([query])[0]
+    scores: list[tuple[int, float, str]] = []
+    for v in videos:
+        df = v.get("df")
+        if not v.get("ready") or df is None or df.empty:
+            continue
+        matrix = np.vstack(df["embedding"].values)
+        sims = cosine_similarity(matrix, [q_emb]).flatten()
+        scores.append((int(v["num"]), float(sims.max()), str(v.get("name", ""))))
+    scores.sort(key=lambda item: item[1], reverse=True)
+    return scores
+
+
+def suggest_video_switch(
+    videos: list[dict],
+    active_num: int,
+    query: str,
+    *,
+    margin: float = 0.04,
+) -> dict | None:
+    """
+    If the question matches another video better than the active one,
+    return {num, name} so the UI can ask the user to switch.
+    """
+    scores = _query_video_scores(videos, query)
+    if len(scores) < 2:
+        return None
+
+    best_num, best_score, best_name = scores[0]
+    if best_num == active_num:
+        return None
+
+    active_score = 0.0
+    for num, score, _ in scores:
+        if num == active_num:
+            active_score = score
+            break
+
+    if best_score <= active_score + margin:
+        return None
+
+    return {"num": best_num, "name": best_name}
+
+
 def answer_question(
     df: pd.DataFrame,
     query: str,
     *,
-    course_name: str = "My course",
     top_k: int = TOP_K,
 ) -> tuple[str, pd.DataFrame]:
     if df is None or df.empty:
@@ -787,5 +864,5 @@ def answer_question(
     similarities = cosine_similarity(matrix, [q_emb]).flatten()
     top_idx = similarities.argsort()[::-1][:top_k]
     context_df = df.loc[top_idx]
-    prompt = build_prompt(query, context_df, course_name)
+    prompt = build_prompt(query, context_df)
     return generate_answer(prompt), context_df
