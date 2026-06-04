@@ -237,6 +237,64 @@ def can_chat() -> bool:
     return proc is None or proc != st.session_state.active_video_num
 
 
+def can_summarize() -> bool:
+    if active_df() is None or not rag_core.use_gemini():
+        return False
+    if st.session_state.is_processing:
+        proc = st.session_state.processing_video_num
+        if proc == st.session_state.active_video_num:
+            return False
+    return True
+
+
+def render_topic_summary() -> None:
+    v = active_video()
+    if not v or not v.get("ready"):
+        return
+
+    if not rag_core.use_gemini():
+        st.caption("Add **GEMINI_API_KEY** to enable **Summarize video with Gemini**.")
+        return
+
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        run_summary = st.button(
+            "Summarize video with Gemini",
+            key=f"gemini_summary_{v['num']}",
+            disabled=not can_summarize(),
+            use_container_width=True,
+        )
+    with c2:
+        clear_summary = (
+            bool(v.get("topic_summary"))
+            and st.button("Clear", key=f"clear_summary_{v['num']}", use_container_width=True)
+        )
+
+    if clear_summary:
+        v["topic_summary"] = None
+        st.rerun()
+
+    if run_summary and can_summarize():
+        with st.spinner("Gemini is listing topics, definitions, and timestamps…"):
+            try:
+                summary = rag_core.summarize_video_with_gemini(
+                    active_df(),
+                    video_title=v.get("name", "Lesson"),
+                )
+                for vid in st.session_state.videos:
+                    if vid["num"] == v["num"]:
+                        vid["topic_summary"] = summary
+                        break
+                st.session_state.last_error = None
+            except Exception as e:
+                st.session_state.last_error = str(e)
+        st.rerun()
+
+    if v.get("topic_summary"):
+        st.markdown("##### Topics & definitions (Gemini)")
+        st.markdown(v["topic_summary"])
+
+
 def _process_item_core(
     item: dict,
     on_step: Callable[[str, str], None] | None = None,
@@ -672,6 +730,8 @@ if active and active.get("ready"):
     )
 elif any_video_ready():
     st.info("Pick a **Ready** video above to chat and see suggested questions.")
+
+render_topic_summary()
 
 render_queued_start_buttons()
 

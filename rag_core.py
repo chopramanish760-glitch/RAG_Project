@@ -675,15 +675,135 @@ Student question: {query}
 If the question is unrelated to the video, politely decline."""
 
 
-def _answer_gemini(prompt: str) -> str:
+def _parse_json_object(raw: str) -> dict:
+    text = raw.strip()
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if match:
+            text = match.group(1).strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start : end + 1]
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise json.JSONDecodeError("Expected JSON object", text, 0)
+    return parsed
+
+
+def _transcript_outline_for_summary(df: pd.DataFrame, max_chars: int = 14000) -> str:
+    lines: list[str] = []
+    total = 0
+    for _, row in df.sort_values("start").iterrows():
+        ts = format_timestamp_range(float(row.get("start", 0)), float(row.get("end", 0)))
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+        line = f"[{ts}] {text}\n"
+        if total + len(line) > max_chars:
+            lines.append(f"[… transcript continues to {format_timestamp(float(df['end'].max()))} …]\n")
+            break
+        lines.append(line)
+        total += len(line)
+    return "".join(lines)
+
+
+def _format_topic_summary_markdown(data: dict) -> str:
+    parts: list[str] = []
+    overview = (data.get("overview") or "").strip()
+    if overview:
+        parts.append(f"**Overview:** {overview}\n")
+    topics = data.get("topics") or []
+    if not topics:
+        raise ValueError("Summary did not include any topics.")
+    for i, item in enumerate(topics, 1):
+        if not isinstance(item, dict):
+            continue
+        topic = str(item.get("topic") or f"Topic {i}").strip()
+        ts = str(item.get("timestamp") or "").strip()
+        definition = str(item.get("definition") or "").strip()
+        if not definition:
+            definition = "_No definition provided._"
+        head = f"### {i}. {topic}"
+        if ts:
+            head += f" · `{ts}`"
+        parts.append(f"{head}\n\n{definition}\n")
+    return "\n".join(parts).strip()
+
+
+def summarize_video_with_gemini(
+    df: pd.DataFrame,
+    *,
+    video_title: str = "Lesson",
+) -> str:
+    """
+    Gemini-only study guide: topics in order with timestamps and definitions.
+    Uses Gemini for definitions when the speaker did not define a term.
+    """
+    if not use_gemini():
+        raise RuntimeError(
+            "GEMINI_API_KEY is required for video summary. "
+            "Add it in `.env` or Streamlit Secrets."
+        )
+    if df is None or df.empty:
+        raise ValueError("No transcript available for this video.")
+
+    max_end = float(df["end"].max()) if "end" in df.columns else 0.0
+    length_hint = format_timestamp(max_end)
+    outline = _transcript_outline_for_summary(df)
+    title = _safe_title(video_title) if video_title else "Lesson"
+
+    prompt = f"""You are an expert educator analyzing a video lesson titled "{title}".
+Total video length is about {length_hint}.
+
+Transcript (each line is [start–end] spoken text):
+{outline}
+
+Create a complete study guide of every major topic taught in this video, in the order they appear.
+
+For each topic:
+- "topic": short name (2–8 words)
+- "timestamp": when the topic STARTS (format M:SS or H:MM:SS only; must be between 0:00 and {length_hint})
+- "definition": 2–4 clear sentences. If the speaker never defined the term, write a correct standard definition for a student.
+
+Also include "overview": 1–2 sentences summarizing the whole video.
+
+Return ONLY valid JSON (no markdown fences):
+{{
+  "overview": "...",
+  "topics": [
+    {{"topic": "...", "timestamp": "0:00", "definition": "..."}}
+  ]
+}}"""
+
+    raw = _answer_gemini(prompt, max_output_tokens=8192)
+    try:
+        data = _parse_json_object(raw)
+        markdown = _format_topic_summary_markdown(data)
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        raise RuntimeError(
+            "Could not parse Gemini summary. Try again in a moment."
+        ) from e
+    return fix_timestamps_in_text(markdown)
+
+
+def _answer_gemini(prompt: str, *, max_output_tokens: int = 2048) -> str:
     client = _gemini()
     last_err = None
+    gen_config = None
+    try:
+        from google.genai import types
+
+        gen_config = types.GenerateContentConfig(max_output_tokens=max_output_tokens)
+    except Exception:
+        gen_config = None
+
     for attempt in range(2):
         try:
-            response = client.models.generate_content(
-                model=GEMINI_CHAT_MODEL,
-                contents=prompt,
-            )
+            kwargs: dict = {"model": GEMINI_CHAT_MODEL, "contents": prompt}
+            if gen_config is not None:
+                kwargs["config"] = gen_config
+            response = client.models.generate_content(**kwargs)
             return (response.text or "").strip()
         except Exception as e:
             last_err = e
