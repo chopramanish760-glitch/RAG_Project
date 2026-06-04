@@ -18,11 +18,17 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.0-flash-lite")
+GEMINI_SUMMARY_MODEL = os.getenv("GEMINI_SUMMARY_MODEL", GEMINI_CHAT_MODEL)
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
-GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
+# Turbo is much faster than whisper-large-v3 for the same API.
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+
+SUMMARY_MAX_TOPICS = int(os.getenv("SUMMARY_MAX_TOPICS", "12"))
+MERGE_CHUNK_TARGET_SEC = float(os.getenv("MERGE_CHUNK_TARGET_SEC", "40"))
+MERGE_CHUNK_MIN_COUNT = int(os.getenv("MERGE_CHUNK_MIN_COUNT", "35"))
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 TOP_K = int(os.getenv("RAG_TOP_K", "5"))
@@ -187,10 +193,10 @@ def _context_for_prompt(context_df: pd.DataFrame) -> str:
                 "video": str(row.get("title", "Lesson")),
                 "at": format_timestamp(float(row.get("start", 0))),
                 "until": format_timestamp(float(row.get("end", 0))),
-                "text": str(row.get("text", ""))[:400],
+                "text": str(row.get("text", ""))[:280],
             }
         )
-    return json.dumps(rows, ensure_ascii=False, indent=2)
+    return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
 GEMINI_EMBED_BATCH_MAX = 100
@@ -270,24 +276,33 @@ def find_ffmpeg() -> str:
 
 
 def video_to_mp3(video_path: str, mp3_path: str) -> None:
+    """Extract mono 16 kHz MP3 — smaller and faster for Whisper APIs."""
     ffmpeg = find_ffmpeg()
     try:
         subprocess.run(
             [
                 ffmpeg,
                 "-y",
+                "-nostdin",
+                "-threads",
+                "0",
                 "-i",
                 str(video_path),
                 "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
                 "-acodec",
                 "libmp3lame",
                 "-q:a",
-                "4",
+                "6",
                 str(mp3_path),
             ],
             check=True,
             capture_output=True,
             text=True,
+            timeout=600,
         )
     except subprocess.CalledProcessError as e:
         err = (e.stderr or e.stdout or str(e)).lower()
@@ -542,7 +557,30 @@ def transcribe_audio(
     return transcribe_with_groq(audio_path, title, language=language)
 
 
+def _merge_chunks_for_index(chunks: list[dict]) -> list[dict]:
+    """Fewer, longer chunks → faster embeddings with little RAG loss."""
+    if len(chunks) < MERGE_CHUNK_MIN_COUNT:
+        return chunks
+    merged: list[dict] = []
+    buf: dict | None = None
+    for c in chunks:
+        if buf is None:
+            buf = dict(c)
+            continue
+        span = float(c.get("end", 0)) - float(buf.get("start", 0))
+        if span < MERGE_CHUNK_TARGET_SEC:
+            buf["end"] = c.get("end", buf.get("end"))
+            buf["text"] = f"{buf.get('text', '').strip()} {c.get('text', '').strip()}".strip()
+        else:
+            merged.append(buf)
+            buf = dict(c)
+    if buf:
+        merged.append(buf)
+    return merged if merged else chunks
+
+
 def chunks_to_dataframe(chunks: list[dict], start_chunk_id: int = 0) -> pd.DataFrame:
+    chunks = _merge_chunks_for_index(chunks)
     texts = [c["text"] for c in chunks]
     embeddings = create_embeddings(texts)
     rows = []
@@ -630,8 +668,12 @@ def estimate_processing_seconds(file_bytes: bytes, filename: str) -> int:
     ext = Path(filename).suffix.lower()
     is_video = ext not in {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
     mb = len(file_bytes) / (1024 * 1024)
-    base = 25 if is_video else 15
-    per_mb = 10 if use_gemini() else 6
+    if prefer_groq_transcribe():
+        base = 18 if is_video else 10
+        per_mb = 4
+    else:
+        base = 25 if is_video else 15
+        per_mb = 8
     return int(base + mb * per_mb)
 
 
@@ -691,20 +733,37 @@ def _parse_json_object(raw: str) -> dict:
     return parsed
 
 
-def _transcript_outline_for_summary(df: pd.DataFrame, max_chars: int = 14000) -> str:
+def _compact_transcript_for_summary(
+    df: pd.DataFrame,
+    *,
+    max_chars: int = 4800,
+    max_lines: int = 36,
+) -> str:
+    """Evenly sample transcript lines so Gemini gets full coverage with less input."""
+    ordered = df.sort_values("start")
+    n = len(ordered)
+    if n == 0:
+        return ""
+    if n <= max_lines:
+        indices = list(range(n))
+    else:
+        indices = [int(i * (n - 1) / (max_lines - 1)) for i in range(max_lines)]
     lines: list[str] = []
     total = 0
-    for _, row in df.sort_values("start").iterrows():
-        ts = format_timestamp_range(float(row.get("start", 0)), float(row.get("end", 0)))
-        text = str(row.get("text", "")).strip()
+    for i in indices:
+        row = ordered.iloc[i]
+        ts = format_timestamp(float(row.get("start", 0)))
+        text = str(row.get("text", "")).strip()[:180]
         if not text:
             continue
         line = f"[{ts}] {text}\n"
         if total + len(line) > max_chars:
-            lines.append(f"[… transcript continues to {format_timestamp(float(df['end'].max()))} …]\n")
             break
         lines.append(line)
         total += len(line)
+    if n > len(indices) and lines:
+        end_ts = format_timestamp(float(ordered["end"].max()))
+        lines.append(f"[… ends ~{end_ts} …]\n")
     return "".join(lines)
 
 
@@ -750,33 +809,28 @@ def summarize_video_with_gemini(
 
     max_end = float(df["end"].max()) if "end" in df.columns else 0.0
     length_hint = format_timestamp(max_end)
-    outline = _transcript_outline_for_summary(df)
+    outline = _compact_transcript_for_summary(df)
     title = _safe_title(video_title) if video_title else "Lesson"
+    topic_cap = max(5, min(SUMMARY_MAX_TOPICS, 15))
 
-    prompt = f"""You are an expert educator analyzing a video lesson titled "{title}".
-Total video length is about {length_hint}.
+    prompt = f"""Study guide for "{title}" (~{length_hint} video).
 
-Transcript (each line is [start–end] spoken text):
+Transcript samples [timestamp] text:
 {outline}
 
-Create a complete study guide of every major topic taught in this video, in the order they appear.
+List the {topic_cap} main topics in order. Skip minor asides.
+Per topic: "topic" (short), "timestamp" (start, M:SS or H:MM:SS, ≤{length_hint}), "definition" (2 sentences; use standard definition if not spoken).
+Add "overview" (1 sentence).
 
-For each topic:
-- "topic": short name (2–8 words)
-- "timestamp": when the topic STARTS (format M:SS or H:MM:SS only; must be between 0:00 and {length_hint})
-- "definition": 2–4 clear sentences. If the speaker never defined the term, write a correct standard definition for a student.
+JSON only:
+{{"overview":"...","topics":[{{"topic":"...","timestamp":"0:00","definition":"..."}}]}}"""
 
-Also include "overview": 1–2 sentences summarizing the whole video.
-
-Return ONLY valid JSON (no markdown fences):
-{{
-  "overview": "...",
-  "topics": [
-    {{"topic": "...", "timestamp": "0:00", "definition": "..."}}
-  ]
-}}"""
-
-    raw = _answer_gemini(prompt, max_output_tokens=8192)
+    raw = _answer_gemini(
+        prompt,
+        max_output_tokens=3072,
+        model=GEMINI_SUMMARY_MODEL,
+        temperature=0.0,
+    )
     try:
         data = _parse_json_object(raw)
         markdown = _format_topic_summary_markdown(data)
@@ -787,20 +841,30 @@ Return ONLY valid JSON (no markdown fences):
     return fix_timestamps_in_text(markdown)
 
 
-def _answer_gemini(prompt: str, *, max_output_tokens: int = 2048) -> str:
+def _answer_gemini(
+    prompt: str,
+    *,
+    max_output_tokens: int = 2048,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> str:
     client = _gemini()
     last_err = None
     gen_config = None
+    model_name = model or GEMINI_CHAT_MODEL
     try:
         from google.genai import types
 
-        gen_config = types.GenerateContentConfig(max_output_tokens=max_output_tokens)
+        cfg_kwargs: dict = {"max_output_tokens": max_output_tokens}
+        if temperature is not None:
+            cfg_kwargs["temperature"] = temperature
+        gen_config = types.GenerateContentConfig(**cfg_kwargs)
     except Exception:
         gen_config = None
 
     for attempt in range(2):
         try:
-            kwargs: dict = {"model": GEMINI_CHAT_MODEL, "contents": prompt}
+            kwargs: dict = {"model": model_name, "contents": prompt}
             if gen_config is not None:
                 kwargs["config"] = gen_config
             response = client.models.generate_content(**kwargs)
@@ -816,7 +880,7 @@ def _answer_gemini(prompt: str, *, max_output_tokens: int = 2048) -> str:
     raise RuntimeError(friendly_api_error(last_err or RuntimeError("No response")))
 
 
-def _answer_groq(prompt: str) -> str:
+def _answer_groq(prompt: str, *, max_tokens: int = 1024) -> str:
     client = _groq()
     response = client.chat.completions.create(
         model=GROQ_CHAT_MODEL,
@@ -827,8 +891,8 @@ def _answer_groq(prompt: str) -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        temperature=0.3,
-        max_tokens=1024,
+        temperature=0.2,
+        max_tokens=max_tokens,
     )
     return response.choices[0].message.content or ""
 
@@ -861,6 +925,34 @@ def generate_answer(prompt: str) -> str:
     return fix_timestamps_in_text(text)
 
 
+def _fast_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
+    """Instant suggestions from transcript samples (no API call)."""
+    if df is None or df.empty:
+        return _fallback_suggested_questions(
+            pd.DataFrame({"title": ["course"], "text": [""]}), count
+        )
+    n = len(df)
+    if n == 1:
+        picks = [0]
+    else:
+        picks = sorted(
+            {int(i * (n - 1) / max(1, count - 1)) for i in range(count)}
+        )
+    questions: list[str] = []
+    for i in picks:
+        row = df.iloc[i]
+        text = _strip_noise_tags(str(row.get("text", "")))
+        if not text:
+            continue
+        snippet = " ".join(text.split()[:8]).strip(".,?!")
+        ts = format_timestamp(float(row.get("start", 0)))
+        if snippet:
+            questions.append(f"What is explained at {ts} about {snippet}?")
+    while len(questions) < count:
+        questions.append("What are the main ideas in this video?")
+    return questions[:count]
+
+
 def _fallback_suggested_questions(df: pd.DataFrame, count: int) -> list[str]:
     titles = [str(t) for t in df["title"].dropna().unique().tolist()]
     questions = [
@@ -880,19 +972,22 @@ def build_suggested_questions(
     df: pd.DataFrame,
     *,
     count: int = 5,
+    fast: bool = False,
 ) -> list[str]:
     """Generate short question suggestions from indexed transcript."""
     if df is None or df.empty:
         return _fallback_suggested_questions(
             pd.DataFrame({"title": ["course"], "text": [""]}), count
         )
+    if fast:
+        return _fast_suggested_questions(df, count)
 
     titles = df["title"].dropna().unique().tolist()[:6]
-    sample_rows = df.head(25)
+    sample_rows = df.iloc[:: max(1, len(df) // 12)][:12]
     lines = []
     for _, row in sample_rows.iterrows():
-        lines.append(f"[{row.get('title', 'Lesson')}] {str(row.get('text', ''))[:120]}")
-    excerpt = "\n".join(lines)[:3500]
+        lines.append(f"[{row.get('title', 'Lesson')}] {str(row.get('text', ''))[:100]}")
+    excerpt = "\n".join(lines)[:2000]
     title_list = ", ".join(str(t) for t in titles)
 
     prompt = f"""Videos: {title_list}
@@ -907,7 +1002,10 @@ Return ONLY a JSON array of strings, no markdown.
 Example: ["What is HTML?", "Where is CSS introduced?"]"""
 
     try:
-        raw = generate_answer(prompt)
+        if use_groq():
+            raw = _answer_groq(prompt, max_tokens=350)
+        else:
+            raw = generate_answer(prompt)
         text = raw.strip()
         if "```" in text:
             match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
@@ -924,15 +1022,28 @@ Example: ["What is HTML?", "Where is CSS introduced?"]"""
     return _fallback_suggested_questions(df, count)
 
 
+def _video_similarity_matrix(v: dict) -> np.ndarray | None:
+    cached = v.get("_sim_matrix")
+    if cached is not None:
+        return cached
+    df = v.get("df")
+    if df is None or df.empty or "embedding" not in df.columns:
+        return None
+    matrix = np.vstack(df["embedding"].values)
+    v["_sim_matrix"] = matrix
+    return matrix
+
+
 def _query_video_scores(videos: list[dict], query: str) -> list[tuple[int, float, str]]:
     """Best similarity score per ready video for a question."""
     q_emb = create_embeddings([query])[0]
     scores: list[tuple[int, float, str]] = []
     for v in videos:
-        df = v.get("df")
-        if not v.get("ready") or df is None or df.empty:
+        if not v.get("ready"):
             continue
-        matrix = np.vstack(df["embedding"].values)
+        matrix = _video_similarity_matrix(v)
+        if matrix is None:
+            continue
         sims = cosine_similarity(matrix, [q_emb]).flatten()
         scores.append((int(v["num"]), float(sims.max()), str(v.get("name", ""))))
     scores.sort(key=lambda item: item[1], reverse=True)
@@ -980,7 +1091,9 @@ def answer_question(
         raise ValueError("Upload and index a video first.")
 
     q_emb = create_embeddings([query])[0]
-    matrix = np.vstack(df["embedding"].values)
+    matrix = _video_similarity_matrix({"df": df, "ready": True})
+    if matrix is None:
+        matrix = np.vstack(df["embedding"].values)
     similarities = cosine_similarity(matrix, [q_emb]).flatten()
     top_idx = similarities.argsort()[::-1][:top_k]
     context_df = df.loc[top_idx]

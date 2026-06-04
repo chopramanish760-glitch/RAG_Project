@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+
 # Quiet Hugging Face cache warning on Windows (first FastEmbed download)
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
@@ -107,6 +109,32 @@ _DEFAULTS = {
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v if not isinstance(v, set) else set()
+
+STALE_PROCESS_SEC = 1200  # reset stuck "Processing" after 20 min
+
+
+def heal_stuck_processing() -> None:
+    """Clear orphaned is_processing flags (crashed run / tab closed mid-job)."""
+    if not st.session_state.get("is_processing"):
+        return
+    proc = st.session_state.get("processing_video_num")
+    started = st.session_state.get("proc_started_at")
+    if proc is None:
+        stale = True
+    elif started is None:
+        stale = True
+    else:
+        stale = (time.time() - float(started)) > STALE_PROCESS_SEC
+    if stale:
+        st.session_state.is_processing = False
+        st.session_state.processing_video_num = None
+        st.session_state.proc_started_at = None
+        st.session_state.proc_eta = None
+        st.session_state.proc_stage = None
+        st.session_state.proc_message = None
+
+
+heal_stuck_processing()
 
 
 def short_name(filename: str, max_len: int = 28) -> str:
@@ -307,7 +335,7 @@ def _process_item_core(
     new_df = rag_core.process_uploaded_media(
         data, name, language=None, video_label=label, on_step=on_step
     )
-    questions = rag_core.build_suggested_questions(new_df, count=5)
+    questions = rag_core.build_suggested_questions(new_df, count=5, fast=True)
     return {
         "num": num,
         "name": name,
@@ -325,6 +353,9 @@ def _apply_process_result(result: dict) -> None:
             v["ready"] = True
             v["error"] = None
             v["suggested_questions"] = result["questions"]
+            v.pop("_sim_matrix", None)
+            if result["df"] is not None and not result["df"].empty:
+                v["_sim_matrix"] = np.vstack(result["df"]["embedding"].values)
             break
     st.session_state.done_sigs.add(result["sig"])
     st.session_state.pending_queue = [
@@ -460,7 +491,8 @@ def ask_tutor(question: str) -> None:
     answer = ""
     try:
         switch = None
-        if sum(1 for v in st.session_state.videos if v.get("ready")) > 1:
+        ready_count = sum(1 for v in st.session_state.videos if v.get("ready"))
+        if ready_count > 1 and len(question.split()) >= 3:
             switch = rag_core.suggest_video_switch(
                 st.session_state.videos,
                 st.session_state.active_video_num,
@@ -536,9 +568,9 @@ def queue_uploads(uploaded_files) -> None:
         if len(new_items) == 1 and (replacing or not st.session_state.active_video_num):
             st.session_state.active_video_num = num
 
-    if len(new_items) > 1:
+    if len(new_items) > 1 and not any_video_ready():
         st.session_state.active_video_num = new_items[0]["video_num"]
-    elif len(new_items) == 1 and not replacing:
+    elif len(new_items) == 1 and (replacing or not any_video_ready()):
         st.session_state.active_video_num = new_items[0]["video_num"]
 
     st.session_state.pending_queue.extend(new_items)
@@ -546,6 +578,13 @@ def queue_uploads(uploaded_files) -> None:
 
 def process_queue(item: dict) -> None:
     """Process one video in the foreground (blocks until done)."""
+    if st.session_state.is_processing:
+        other = st.session_state.processing_video_num
+        if other != item.get("video_num"):
+            st.warning(
+                f"**Video {other}** is still processing. Wait for it to finish or click **Reset**."
+            )
+            return
     st.session_state.is_processing = True
     st.session_state.processing_video_num = item["video_num"]
     st.session_state.last_error = None
