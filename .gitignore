@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+audios/
+videos/
+*.joblib
+prompt.txt
+response.txt
+assets/
+
