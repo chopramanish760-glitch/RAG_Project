@@ -107,6 +107,4 @@ The application can be deployed using:
 
 Manish Chopra
 
-## License
 
-MIT License
