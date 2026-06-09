@@ -1,38 +1,112 @@
 # mY_Tutor
 
-AI tutor for your videos — upload up to 5 lessons, get transcripts, then ask questions with timestamps.
+An AI-powered learning assistant that transforms educational videos into interactive lessons. Upload videos, generate transcripts, ask questions, and receive context-aware answers with timestamps using Retrieval-Augmented Generation (RAG).
 
-## Quick start (local)
+## Features
 
-1. Get a **Gemini API key**: https://aistudio.google.com/apikey  
-2. Copy `.env.example` → `.env` and set `GEMINI_API_KEY`.  
-3. Install [ffmpeg](https://ffmpeg.org/download.html) (for video files).  
-4. Run:
+* Upload and analyze video lessons
+* Automatic transcription using Gemini
+* AI-powered question answering
+* Timestamp-based responses
+* Suggested learning questions
+* Multi-video support
+* Semantic search with embeddings
+* Retrieval-Augmented Generation (RAG)
+* Fast and interactive Streamlit interface
+* Local vector search with FastEmbed
+
+## Tech Stack
+
+### AI & LLMs
+
+* Google Gemini
+* Groq (optional fallback)
+* RAG Pipeline
+
+### Backend
+
+* Python
+* FastEmbed
+* Vector Search
+
+### Frontend
+
+* Streamlit
+
+### Media Processing
+
+* FFmpeg
+
+## How It Works
+
+1. Upload a video lesson.
+2. Generate transcript automatically.
+3. Convert transcript into embeddings.
+4. Store chunks for semantic retrieval.
+5. Ask questions about the lesson.
+6. Receive AI-generated answers with relevant timestamps.
+
+## Installation
+
+### Clone Repository
+
+```bash
+git clone https://github.com/chopramanish760-glitch/RAG_Project.git
+cd RAG_Project
+```
+
+### Install Dependencies
 
 ```bash
 pip install -r requirements.txt
+```
+
+### Configure Environment
+
+Create a `.env` file:
+
+```env
+GEMINI_API_KEY=your_api_key
+```
+
+### Run Application
+
+```bash
 streamlit run app.py
 ```
 
-5. Upload videos (wait until each is ready) → use suggested questions or chat.
+## Project Structure
 
-**First run:** FastEmbed downloads a small model (~67 MB) once; HF Hub warnings on Windows are harmless.
+```text
+app.py
+rag_core.py
+requirements.txt
+.env.example
+DEPLOY.md
+.streamlit/
+```
 
-## Deploy online
+## Use Cases
 
-**Host:** [Streamlit Community Cloud](https://share.streamlit.io)
+* Course revision
+* Lecture Q&A
+* Video learning assistant
+* Educational content search
+* AI-powered study companion
 
-Full steps: **[DEPLOY.md](DEPLOY.md)**
+## Deployment
 
-## Stack
+The application can be deployed using:
 
-| Feature | Service |
-|---------|---------|
-| Transcription | Gemini |
-| Chat & suggestions | Gemini |
-| Embeddings | Local FastEmbed (BGE-small); optional Gemini |
-| Fallback | Groq (optional) |
+* Streamlit Community Cloud
+* Render
+* Docker
+* Local Machine
 
-## Repo
+## Author
 
-https://github.com/chopramanish760-glitch/RAG_Project
+Manish Chopra
+
+## License
+
+MIT License
